@@ -72,7 +72,11 @@ LABEL_FONT   = "Arial"
 BODY_FONT    = "Arial"
 
 ASSETS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
-LOGO_PATH   = os.path.join(ASSETS_DIR, "haddad_logo.png")
+# Dark-mode logo: transparent background, white wordmark, red heart preserved.
+# Generated from haddad_logo.png by replacing the connected white background
+# (corner-flood-fill) with transparency and inverting the dark wordmark text
+# to white. Looks correct on the black header bar.
+LOGO_PATH   = os.path.join(ASSETS_DIR, "haddad_logo_dark.png")
 
 
 # ── Canonical orderings ──────────────────────────────────────────────────────
