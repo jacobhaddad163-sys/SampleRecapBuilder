@@ -1613,7 +1613,15 @@ def build_sample_slide(prs, deck, sample, extra_images=None):
             details_lines.append(f"Fabric: {sample.fabric}")
         # AI-generated details only render at HIGH confidence — when not 100%
         # visible we'd rather show nothing than risk a wrong description.
-        if sample.details and is_high_conf:
+        # The sidebar "Include AI product description" toggle suppresses this
+        # line deck-wide without clearing the per-sample field, so re-enabling
+        # is a single click rather than another analysis pass.
+        include_details = True
+        try:
+            include_details = bool(st.session_state.get("include_details", True))
+        except Exception:
+            pass
+        if sample.details and is_high_conf and include_details:
             details_lines.append(sample.details)
         if sample.notes:
             details_lines.append(sample.notes)
@@ -1774,6 +1782,12 @@ def init_state():
         st.session_state._seen_hashes = {}
     if "auto_merge_duplicates" not in st.session_state:
         st.session_state.auto_merge_duplicates = False
+    if "include_details" not in st.session_state:
+        # Default ON to preserve existing deck behavior. User can disable
+        # from the sidebar to drop the AI-extracted "notable features" line
+        # from every sample slide in one click — useful when descriptions
+        # are noisy or when the team prefers a cleaner, fields-only slide.
+        st.session_state.include_details = True
 
 
 def go(step):
@@ -1814,6 +1828,16 @@ def show_sidebar():
             label_visibility="collapsed",
         )
         st.session_state.model_name = model
+        st.markdown("---")
+        st.markdown("**Slide content**")
+        st.session_state.include_details = st.checkbox(
+            "Include AI product description",
+            value=st.session_state.get("include_details", True),
+            help="When on, each sample slide prints the AI-extracted "
+                 "'notable features' line (e.g. 'Drop-shoulder oversized fit'). "
+                 "Turn off for a cleaner slide that only shows the structured "
+                 "fields. Affects every slide in the deck. Colorways, fabric, "
+                 "and any notes you typed in still print.")
         st.markdown("---")
         if st.button("↻ Start over", use_container_width=True):
             for k in list(st.session_state.keys()):
