@@ -123,6 +123,16 @@ MODEL_IDS = {
     "sonnet": "claude-sonnet-4-6",
 }
 
+
+def _price_key_for_model(model_id):
+    """Pick the PRICING bucket that matches a model_id string. Sonnet's
+    rates are ~3× Haiku's, so charging Haiku rates against Sonnet usage
+    understated the displayed cost by roughly two-thirds."""
+    mid = (model_id or "").lower()
+    if "sonnet" in mid:
+        return "sonnet"
+    return "haiku"
+
 # ── Scaling caps (enforced at upload to prevent runtime OOMs / timeouts) ─────
 # At ~150KB per re-encoded JPEG these limits keep peak temp-dir usage under
 # ~75MB and keep the 4-stage analysis pipeline finishing in roughly 4 minutes
@@ -171,6 +181,14 @@ class SampleRecord:
         # or alternate-color shots of the same physical garment. The previous
         # sample's metadata is what shows on the combined slide.
         self.merge_with_previous = False
+        # Stable identity of the PRIMARY sample this sample is merged into
+        # (the primary's `filename`). Empty string = this sample is its own
+        # primary and gets its own slide. We resolve groups by filename
+        # rather than by adjacency so that re-sorting after a category /
+        # brand / gender edit can't reassign a merged photo to an unrelated
+        # primary. merge_with_previous remains as the catalog checkbox
+        # state; merge_into is the source of truth for build_deck.
+        self.merge_into = ""
 
 
 class PresenterConfig:
@@ -302,14 +320,32 @@ def _encode_one_upload(raw_bytes, dest_path):
 
 def rotate_image_file(path, degrees):
     """Rotate the image at `path` by the given degrees (90, 180, 270 — clockwise
-    when negative). Overwrites in place. Used by the Review step's rotate buttons."""
+    when negative). Overwrites in place. Used by the Review step's rotate buttons.
+
+    For the 90/180/270 case (the only values that ever come in from the UI or
+    the AI auto-rotator) we use PIL's `transpose` which is a pixel-exact axis
+    swap — no resampling, no interpolation. We still re-encode JPEG, which is
+    lossy, but bumping quality to 95 keeps repeated rotation cycles visually
+    indistinguishable from the source for the kind of editing the user is
+    likely to do (one or two rotations to fix a sideways photo).
+    """
     if not PIL_OK or not os.path.exists(path):
         return False
     try:
+        deg = int(degrees) % 360
         with PILImage.open(path) as im:
-            # PIL rotate is counter-clockwise; negate to make positive = CW
-            rotated = im.rotate(-degrees, expand=True)
-            rotated.convert("RGB").save(path, "JPEG", quality=85)
+            if deg == 0:
+                return True
+            if deg == 90:
+                rotated = im.transpose(PILImage.Transpose.ROTATE_270)  # CW 90
+            elif deg == 180:
+                rotated = im.transpose(PILImage.Transpose.ROTATE_180)
+            elif deg == 270:
+                rotated = im.transpose(PILImage.Transpose.ROTATE_90)   # CW 270 = CCW 90
+            else:
+                # Arbitrary angle (rare path): resampled rotate, expand.
+                rotated = im.rotate(-deg, expand=True)
+            rotated.convert("RGB").save(path, "JPEG", quality=95)
         return True
     except Exception as e:
         logging.warning("rotate failed for %s: %s", path, e)
@@ -653,8 +689,9 @@ def _run_analysis_batch(client, model_id, samples, presenter_name, default_bough
             )
             if hasattr(resp, "usage"):
                 u = resp.usage
-                # rough cost estimate (haiku rates by default)
-                p_in, p_out = PRICING["haiku"]
+                # Use the actual model's pricing — Sonnet is ~3× Haiku so a
+                # hardcoded "haiku" bucket would understate Sonnet cost.
+                p_in, p_out = PRICING[_price_key_for_model(model_id)]
                 cost += (u.input_tokens * p_in + u.output_tokens * p_out) / 1_000_000
             if not resp.content:
                 raise ValueError("empty response")
@@ -738,6 +775,22 @@ def _run_analysis_batch(client, model_id, samples, presenter_name, default_bough
             if "401" in err or "authentication" in err.lower() or "invalid x-api-key" in err.lower():
                 raise RuntimeError(f"API_KEY_INVALID: {err}") from e
             is_rate = "429" in err or "rate" in err.lower() or "overloaded" in err.lower()
+            # If the model hit max_tokens and returned fewer than `len(samples)`
+            # entries, retrying the same batch with the same content won't help
+            # — the input is identical and we'll truncate again. Split the
+            # batch in half and recurse so each half fits inside max_tokens.
+            # We do this on the LAST attempt only (after rate-limit / transient
+            # retries have failed) and only when len(samples) > 1.
+            is_short = "short response" in err.lower()
+            if is_short and attempt >= 1 and len(samples) > 1:
+                mid = len(samples) // 2
+                logging.info("splitting truncated batch %d→%d+%d for %s",
+                             len(samples), mid, len(samples) - mid, presenter_name)
+                cost_a = _run_analysis_batch(client, model_id, samples[:mid],
+                                              presenter_name, default_bought_from)
+                cost_b = _run_analysis_batch(client, model_id, samples[mid:],
+                                              presenter_name, default_bought_from)
+                return cost + (cost_a or 0.0) + (cost_b or 0.0)
             if attempt == 3:
                 for r in samples:
                     r.analysis_error = f"ERROR: {err[:80]}"
@@ -815,7 +868,7 @@ def _orient_verify_call(client, model_id, image_path, category):
         cost = 0.0
         if hasattr(resp, "usage"):
             u = resp.usage
-            p_in, p_out = PRICING["haiku"]
+            p_in, p_out = PRICING[_price_key_for_model(model_id)]
             cost = (u.input_tokens * p_in + u.output_tokens * p_out) / 1_000_000
         if not resp.content:
             return None, cost
@@ -1079,7 +1132,7 @@ Output JSON ONLY, no preamble. Every image 1..{n} must appear in exactly one gro
         cost = 0.0
         if hasattr(resp, "usage"):
             u = resp.usage
-            p_in, p_out = PRICING["haiku"]  # rough estimate
+            p_in, p_out = PRICING[_price_key_for_model(model_id)]
             cost = (u.input_tokens * p_in + u.output_tokens * p_out) / 1_000_000
         if not resp.content:
             return [[i + 1] for i in range(n)], cost
@@ -1126,6 +1179,7 @@ def ai_suggest_merges_for_presenter(client, model_id, presenter,
     # Reset existing merge flags so we don't compound previous decisions
     for r in sorted_samples:
         r.merge_with_previous = False
+        r.merge_into = ""
     CHUNK = 12
     total_cost = 0.0
     chunks = [sorted_samples[i:i + CHUNK]
@@ -1145,8 +1199,12 @@ def ai_suggest_merges_for_presenter(client, model_id, presenter,
             # between two visually similar ones.
             if ordered != list(range(ordered[0], ordered[-1] + 1)):
                 continue
+            primary = chunk[ordered[0] - 1]
             for pos in ordered[1:]:
                 chunk[pos - 1].merge_with_previous = True
+                # Stable identity: store the primary's filename so the merge
+                # survives re-sort triggered by user edits to sort keys.
+                chunk[pos - 1].merge_into = primary.filename
         return cost
 
     workers = min(4, max(1, len(chunks)))
@@ -1578,6 +1636,54 @@ def sort_samples(samples):
     return sorted(samples, key=key)
 
 
+def resolve_merge_groups(sorted_samples):
+    """Build slide groups from a sorted sample list.
+
+    Returns a list of (primary_record, [extra_preview_paths]) tuples, one
+    entry per slide. Honors `merge_into` (stable filename identity) so that
+    a sample merged into garment X stays with X even if user edits to
+    category/brand/gender change the sort order. Falls back to adjacency
+    via merge_with_previous for legacy records that pre-date merge_into.
+
+    Group order = order in which each primary first appears in sorted_samples.
+    """
+    by_name = {s.filename: s for s in sorted_samples}
+
+    def root(s, seen=None):
+        seen = seen or set()
+        cur = s
+        # Walk merge_into chain to the ultimate primary, with a cycle guard.
+        while (cur.merge_into
+               and cur.merge_into != cur.filename
+               and cur.merge_into in by_name
+               and cur.filename not in seen):
+            seen.add(cur.filename)
+            cur = by_name[cur.merge_into]
+        return cur
+
+    groups = []
+    idx_by_primary = {}
+    for s in sorted_samples:
+        primary = root(s)
+        if primary is s:
+            # Primary (either standalone, or the root of a merge chain)
+            if s.merge_with_previous and not s.merge_into and groups:
+                # Legacy adjacency fallback: merge_with_previous=True but no
+                # stable identity. Append to the most recently seen group.
+                groups[-1][1].append(s.preview_path)
+            else:
+                if s.filename not in idx_by_primary:
+                    idx_by_primary[s.filename] = len(groups)
+                    groups.append([s, []])
+        else:
+            # Merged via merge_into (stable identity)
+            if primary.filename not in idx_by_primary:
+                idx_by_primary[primary.filename] = len(groups)
+                groups.append([primary, []])
+            groups[idx_by_primary[primary.filename]][1].append(s.preview_path)
+    return groups
+
+
 def build_deck(deck, output_path, on_progress=None):
     prs = Presentation()
     prs.slide_width = SW
@@ -1595,16 +1701,10 @@ def build_deck(deck, output_path, on_progress=None):
         sorted_samples = sort_samples(p.samples)
         build_presenter_cover(prs, p, deck, len(sorted_samples))
 
-        # Walk in sorted order, collapsing consecutive merge_with_previous
-        # samples onto the previous sample's slide. The first sample is always
-        # primary (can't merge with nothing). The merge flag is set in the
-        # Review step.
-        groups = []  # list of (primary, [extra_image_paths])
-        for s in sorted_samples:
-            if s.merge_with_previous and groups:
-                groups[-1][1].append(s.preview_path)
-            else:
-                groups.append([s, []])
+        # Resolve groups by stable merge_into identity (with legacy adjacency
+        # fallback). This means a sample merged into garment X stays with X
+        # even if the user changed X's category and the sort order shifted.
+        groups = resolve_merge_groups(sorted_samples)
 
         for primary, extras in groups:
             # Auto-populate color palette from the primary photo if needed.
@@ -1972,13 +2072,18 @@ def show_analyze():
         # this dict; the main thread (this function body) is the only thing
         # that touches Streamlit UI elements — that keeps us out of trouble
         # with Streamlit's not-quite-thread-safe rendering.
+        #
+        # Key by id(presenter) instead of presenter name so two presenters
+        # who share a name (or are both blank) still get separate progress
+        # slots. We keep the display name alongside for the UI.
         state_lock = threading.Lock()
-        presenter_progress = {p.name: (0, 1) for p in presenters_with_samples}
+        presenter_progress = {id(p): [p.name, 0, 1] for p in presenters_with_samples}
 
-        def make_progress_cb(p_name):
+        def make_progress_cb(p_obj):
             def cb(done, total_b, _name=None):
                 with state_lock:
-                    presenter_progress[p_name] = (done, total_b)
+                    presenter_progress[id(p_obj)][1] = done
+                    presenter_progress[id(p_obj)][2] = total_b
             return cb
 
         # Up to 3 presenters analyzed concurrently. Each presenter's internal
@@ -2000,7 +2105,7 @@ def show_analyze():
             with ThreadPoolExecutor(max_workers=PRESENTER_CONCURRENCY) as pool:
                 futures = {
                     pool.submit(analyze_presenter_samples, client, model_id, p,
-                                make_progress_cb(p.name)): p
+                                make_progress_cb(p)): p
                     for p in presenters_with_samples
                 }
                 pending = set(futures.keys())
@@ -2022,14 +2127,15 @@ def show_analyze():
                             completed_samples += len(p.samples)  # avoid stuck progress
                     # Render snapshot from main thread.
                     with state_lock:
-                        snap = list(presenter_progress.items())
+                        snap = [(name, d, t)
+                                for (name, d, t) in presenter_progress.values()]
                     elapsed = time.time() - start_time
                     frac = completed_samples / max(1, total_samples)
                     eta = _format_eta(elapsed, frac)
                     progress.progress(min(0.95, frac),
                                       text=f"{completed_samples}/{total_samples} samples analyzed{eta}")
-                    in_flight_lines = [f"  {name}: batch {d}/{t}"
-                                       for name, (d, t) in snap if 0 < d < t]
+                    in_flight_lines = [f"  {name or '(unnamed)'}: batch {d}/{t}"
+                                       for name, d, t in snap if 0 < d < t]
                     if in_flight_lines:
                         log.write("Analyzing:\n" + "\n".join(in_flight_lines))
 
@@ -2167,7 +2273,7 @@ def show_catalog():
                                 cost = ai_suggest_merges_for_presenter(
                                     client, model_id, p)
                                 merged_n = sum(1 for s in p.samples
-                                               if s.merge_with_previous)
+                                               if s.merge_with_previous or s.merge_into)
                                 st.success(f"Detected {merged_n} duplicate "
                                             f"photo{'s' if merged_n != 1 else ''}. "
                                             f"Cost: ${cost:.3f}")
@@ -2176,23 +2282,76 @@ def show_catalog():
                             except Exception as ex:
                                 st.error(f"Auto-merge failed: {ex}")
             with mc2:
-                if any(s.merge_with_previous for s in p.samples):
+                if any(s.merge_with_previous or s.merge_into for s in p.samples):
                     if st.button("↺ Reset all merges",
                                  key=f"resetmerge_{p_i}",
                                  use_container_width=True):
                         for s in p.samples:
                             s.merge_with_previous = False
+                            s.merge_into = ""
                         st.rerun()
             sorted_samples = sort_samples(p.samples)
-            for idx, rec in enumerate(sorted_samples):
+
+            # Pagination: at scale (the app's caps allow 150 samples per
+            # presenter / 500 total) rendering every row at once stalls
+            # Streamlit — every script run re-builds every image preview,
+            # form, and expander. Page by PAGE_SIZE so edits stay snappy.
+            # idx values still refer to position in the full sorted list so
+            # the merge-into-previous logic remains correct.
+            CATALOG_PAGE_SIZE = 25
+            n_samples = len(sorted_samples)
+            page_key = f"_catpage_{p_i}"
+            if n_samples > CATALOG_PAGE_SIZE:
+                pages = (n_samples + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE
+                page = max(0, min(st.session_state.get(page_key, 0), pages - 1))
+                st.session_state[page_key] = page
+                nav_a, nav_b, nav_c, nav_d = st.columns([1, 4, 1, 1])
+                if nav_a.button("← Prev", key=f"prev_{p_i}",
+                                disabled=(page == 0),
+                                use_container_width=True):
+                    st.session_state[page_key] = page - 1
+                    st.rerun()
+                lo = page * CATALOG_PAGE_SIZE + 1
+                hi = min(n_samples, (page + 1) * CATALOG_PAGE_SIZE)
+                nav_b.markdown(
+                    f"<div style='text-align:center;padding-top:8px;color:#6B6F76;"
+                    f"font-size:13px;'>Page <b>{page + 1}</b> of <b>{pages}</b> "
+                    f"— samples {lo}–{hi} of {n_samples}</div>",
+                    unsafe_allow_html=True)
+                if nav_c.button("Next →", key=f"next_{p_i}",
+                                disabled=(page >= pages - 1),
+                                use_container_width=True):
+                    st.session_state[page_key] = page + 1
+                    st.rerun()
+                # Quick jump for big decks
+                with nav_d:
+                    new_page = st.selectbox(
+                        "Jump", options=list(range(1, pages + 1)),
+                        index=page, key=f"jump_{p_i}",
+                        label_visibility="collapsed") - 1
+                    if new_page != page:
+                        st.session_state[page_key] = new_page
+                        st.rerun()
+                visible_start = page * CATALOG_PAGE_SIZE
+                visible_end = min(n_samples, visible_start + CATALOG_PAGE_SIZE)
+            else:
+                visible_start = 0
+                visible_end = n_samples
+
+            for idx in range(visible_start, visible_end):
+                rec = sorted_samples[idx]
                 rec_key = f"{p.name}_{idx}"
-                # If this sample is merged into the previous one, mark visually.
-                if idx > 0 and rec.merge_with_previous:
+                # If this sample is merged into another sample's slide, mark
+                # visually. Derived from merge_into so the indicator is
+                # correct even after the sort changed (i.e. the primary may
+                # no longer be the immediately-preceding row).
+                is_merged = bool(rec.merge_into) or (idx > 0 and rec.merge_with_previous)
+                if idx > 0 and is_merged:
                     st.markdown(
                         '<div style="border-left:3px solid #C8102E; padding:6px 12px; '
                         'margin:6px 0; background:#FAF1F2; color:#7A0E1F; font-size:11px; '
                         'font-weight:700; text-transform:uppercase; letter-spacing:.05em;">'
-                        '↳ Merged into the slide above</div>',
+                        '↳ Merged into another slide</div>',
                         unsafe_allow_html=True)
                 # Red banner if AI analysis failed entirely on this record —
                 # without this, the user just sees "Other" / blank fields and
@@ -2241,14 +2400,27 @@ def show_catalog():
                                 st.rerun()
                         # Merge toggle (not available for the very first sample)
                         if idx > 0:
+                            # Display the checkbox as "on" whenever the
+                            # sample is merged into anything — even if a
+                            # later sort change made its primary no longer
+                            # adjacent. The stable identity is merge_into.
+                            checkbox_val = bool(rec.merge_with_previous or rec.merge_into)
                             new_val = st.checkbox(
                                 "Combine with previous slide",
-                                value=rec.merge_with_previous,
+                                value=checkbox_val,
                                 key=f"merge_{rec_key}",
                                 help="Add this image to the previous sample's slide "
                                      "(use for back / detail / alternate-color shots).")
-                            if new_val != rec.merge_with_previous:
+                            if new_val != checkbox_val:
                                 rec.merge_with_previous = new_val
+                                if new_val:
+                                    # Snapshot the primary's identity NOW so the
+                                    # merge survives later re-sorts.
+                                    prev = sorted_samples[idx - 1]
+                                    rec.merge_into = (
+                                        prev.merge_into or prev.filename)
+                                else:
+                                    rec.merge_into = ""
                                 st.rerun()
                     with cB:
                         # Confidence indicator + "verify" override. Brand and
@@ -2334,8 +2506,10 @@ def show_build():
                 f'<div class="srb-stat-label">Presenters</div>', unsafe_allow_html=True)
     cB.markdown(f'<div class="srb-stat">{total_samples}</div>'
                 f'<div class="srb-stat-label">Samples</div>', unsafe_allow_html=True)
+    # Match build_deck: title + presentation-order + per-presenter
+    # (cover + one slide per resolved primary group).
     expected_slides = 2 + sum(
-        1 + sum(1 for s in p.samples if not s.merge_with_previous)
+        1 + len(resolve_merge_groups(sort_samples(p.samples)))
         for p in presenters_with_samples)
     cC.markdown(f'<div class="srb-stat">{expected_slides}</div>'
                 f'<div class="srb-stat-label">Slides</div>', unsafe_allow_html=True)
