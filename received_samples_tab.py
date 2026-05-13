@@ -161,6 +161,12 @@ class ReceivedSample:
         # in. Empty string before classification (bulk mode), or set
         # immediately on upload (manual mode).
         self.brand         = ""
+        # AI- or user-assigned category. Distinct from `brand` — used by
+        # _bucket_samples_into_sections to route hosiery/accessory/cap
+        # photos into cross-brand "ALL BRANDS X" sections so a Nike sock
+        # doesn't end up with Nike apparel. Defaults to apparel when set
+        # manually (user already picked the section); set by AI in bulk.
+        self.category      = "apparel"
         # Brand-detection confidence so we can surface low-confidence rows
         # in the Review step. HIGH = unambiguous logo/tag; LOW = guess.
         self.brand_confidence = ""
@@ -254,51 +260,82 @@ def _get_temp_dir():
 
 # ── AI: brand detection ──────────────────────────────────────────────────────
 BRAND_DETECT_SYSTEM = (
-    "You are a children's and adult apparel brand-identification reviewer. "
-    "You look at one sample photo and identify the BRAND on the garment "
-    "(hangtag, neck label, sewn-in label, printed logo, embroidery, "
-    "packaging). You are conservative: if the brand is not clearly visible "
-    "in the photo, you reply with 'unknown' — never guess."
+    "You are a children's and adult apparel sample reviewer. You look at "
+    "one sample photo and identify (a) the BRAND on the item (from "
+    "hangtag, neck label, sewn-in label, printed logo, embroidery, "
+    "packaging) and (b) the CATEGORY of the item — apparel, hosiery, "
+    "accessory, cap, or footwear. You are conservative: if a field is "
+    "not clearly readable, you say 'unknown' rather than guess."
 )
 
 
+# Canonical category set. Drives the bucketing in
+# _bucket_samples_into_sections — anything not 'apparel' or 'footwear'
+# routes into a cross-brand "ALL BRANDS X" section to match the
+# reference deck layout where hosiery, accessory, and caps are grouped
+# across brands rather than under the manufacturer.
+RS_CATEGORIES = ("apparel", "hosiery", "accessory", "cap", "footwear", "unknown")
+
+
 def _brand_detect_call(client, model_id, image_path, candidate_brands):
-    """Single-image API call: return (brand, confidence, cost).
+    """Single-image API call: return (brand, category, confidence, cost).
 
     `candidate_brands` is a list of brand names the user has already
     introduced (existing sections). We pass these as hints so the model
     prefers matching an existing section over inventing a new one — same
     photo of "Jordan" stays in the same bucket as last week's. Free-text
     output still allowed when no candidate fits.
+
+    Category is one of RS_CATEGORIES. The caller routes hosiery /
+    accessory / cap into the corresponding "ALL BRANDS X" section so a
+    Nike sock and a Jordan sock both land on the hosiery slides, not
+    in the brand's apparel slides — matching the reference decks.
     """
     import Sample_Recap_Builder_Web as sbs
     if not os.path.exists(image_path):
-        return "", "", 0.0
+        return "", "unknown", "", 0.0
     b64 = sbs.encode_image_b64(image_path)
     candidates_clause = ""
     if candidate_brands:
         clean = ", ".join(b for b in candidate_brands if b.strip())
         candidates_clause = (
-            f"\nThe user has already set up these sections in this deck: "
-            f"[{clean}]. If the brand on this photo clearly matches one "
-            f"of those names (case-insensitive), return that exact spelling "
-            f"so we can group photos together. Otherwise return the "
-            f"brand as you read it from the photo."
+            f"\nThe user has already set up these brand sections in this "
+            f"deck: [{clean}]. If the brand on this photo clearly matches "
+            f"one of those names (case-insensitive), return that exact "
+            f"spelling so we can group photos together. Otherwise return "
+            f"the brand as you read it from the photo."
         )
     prompt = (
-        "Identify the BRAND on the apparel sample in this photo. Read "
-        "hangtags, neck labels, sewn-in labels, screen-printed or "
-        "embroidered logos, and packaging. Reply with JSON only:\n"
-        '  {"brand": "<brand name as you read it, in title case>", '
-        '"confidence": "HIGH" | "MEDIUM" | "LOW"}\n'
-        "Use 'unknown' as the brand value when no brand text or logo is "
-        "clearly readable. Use HIGH only when you are reading the brand "
-        "directly from a visible label/logo (no inference from style)."
+        "Identify both the BRAND and the CATEGORY of the sample in this "
+        "photo.\n\n"
+        "BRAND: read hangtags, neck labels, sewn-in labels, screen-printed "
+        "or embroidered logos, and packaging. Return the brand as you "
+        "read it from the photo (title case). Use 'unknown' if no brand "
+        "text or logo is clearly readable. Do not infer the brand from "
+        "garment style.\n\n"
+        "CATEGORY: classify the item itself, NOT the brand. Use exactly "
+        "one of these values:\n"
+        "  - apparel    = tops, bottoms, dresses, sets, outerwear, "
+        "activewear, sleepwear, swimwear, underwear, baby clothing\n"
+        "  - hosiery    = socks (any length), tights, leg warmers\n"
+        "  - accessory  = bags, backpacks, belts, headbands, gloves, "
+        "scarves, jewelry, fanny packs, crossbody bags, totes — anything "
+        "worn or carried that isn't apparel/footwear/hosiery/caps\n"
+        "  - cap        = baseball caps, snapbacks, bucket hats, "
+        "beanies, dad hats\n"
+        "  - footwear   = shoes, sneakers, boots, sandals, slides\n"
+        "  - unknown    = ambiguous or unreadable\n\n"
+        "Reply with JSON only:\n"
+        '  {"brand": "<brand>", "category": "<one of: apparel, hosiery, '
+        'accessory, cap, footwear, unknown>", '
+        '"confidence": "HIGH" | "MEDIUM" | "LOW"}\n\n'
+        "Confidence is HIGH only when both brand and category are read "
+        "from clearly visible labels/logos/shape (no guessing)."
         + candidates_clause
     )
     try:
         resp = client.messages.create(
-            model=model_id, max_tokens=180,
+            model=model_id, max_tokens=220,
             system=[{"type": "text", "text": BRAND_DETECT_SYSTEM,
                      "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": [
@@ -311,30 +348,34 @@ def _brand_detect_call(client, model_id, image_path, candidate_brands):
         )
     except Exception as ex:
         logging.warning("brand detect call failed: %s", ex)
-        return "", "", 0.0
+        return "", "unknown", "", 0.0
     cost = 0.0
     if hasattr(resp, "usage"):
         u = resp.usage
         p_in, p_out = PRICING[_price_key_for_model(model_id)]
         cost = (u.input_tokens * p_in + u.output_tokens * p_out) / 1_000_000
     if not resp.content:
-        return "", "", cost
+        return "", "unknown", "", cost
     parsed = sbs.parse_json_response(resp.content[0].text)
     if not parsed:
-        return "", "", cost
+        return "", "unknown", "", cost
     brand = (parsed.get("brand") or "").strip()
-    conf  = (parsed.get("confidence") or "MEDIUM").strip().upper()
+    category = (parsed.get("category") or "unknown").strip().lower()
+    if category not in RS_CATEGORIES:
+        category = "unknown"
+    conf = (parsed.get("confidence") or "MEDIUM").strip().upper()
     if conf not in ("HIGH", "MEDIUM", "LOW"):
         conf = "MEDIUM"
     if brand.lower() == "unknown":
         brand = ""
-    return brand, conf, cost
+    return brand, category, conf, cost
 
 
 def _detect_brands_for_samples(client, model_id, samples,
                                 candidate_brands, on_progress=None):
-    """Run brand detection in parallel for a flat list of samples. Mutates
-    sample.brand / sample.brand_confidence. Returns total dollar cost."""
+    """Run brand+category detection in parallel for a flat list of
+    samples. Mutates sample.brand / sample.category / sample.brand_confidence.
+    Returns total dollar cost."""
     if not samples:
         return 0.0
     workers = min(6, len(samples))
@@ -349,11 +390,12 @@ def _detect_brands_for_samples(client, model_id, samples,
         for fut in as_completed(futs):
             s = futs[fut]
             try:
-                brand, conf, cost = fut.result()
+                brand, category, conf, cost = fut.result()
             except Exception as ex:
                 logging.warning("brand detect worker failed: %s", ex)
-                brand, conf, cost = "", "", 0.0
+                brand, category, conf, cost = "", "unknown", "", 0.0
             s.brand = brand
+            s.category = category or "unknown"
             s.brand_confidence = conf
             total_cost += cost
             done += 1
@@ -362,20 +404,40 @@ def _detect_brands_for_samples(client, model_id, samples,
     return total_cost
 
 
+# Cross-brand category sections — these match the reference deck layout
+# where Nike, Jordan, and adidas socks all collect on the same hosiery
+# pages rather than under their respective brand sections.
+ALL_BRANDS_SECTIONS = {
+    "hosiery":   "ALL BRANDS HOSIERY",
+    "accessory": "ALL BRANDS ACCESSORY",
+    "cap":       "ALL BRANDS caps",
+}
+
+
+def _target_section_name(samp: ReceivedSample) -> str:
+    """Where should this sample land? Hosiery/accessory/cap photos route
+    into the cross-brand ALL-BRANDS sections. Apparel and footwear route
+    to a brand-named section. Empty-brand apparel falls back to Unsorted."""
+    cat = (samp.category or "").lower()
+    if cat in ALL_BRANDS_SECTIONS:
+        return ALL_BRANDS_SECTIONS[cat]
+    brand = (samp.brand or "").strip()
+    if brand:
+        return brand
+    return "Unsorted"
+
+
 def _bucket_samples_into_sections(deck: ReceivedDeck, samples):
-    """Given a flat list of samples (each with sample.brand possibly set),
-    distribute them into deck.sections — creating new sections on demand
-    for brands the deck doesn't already have. Empty-brand samples go into
-    a special 'Unsorted' section the user can re-classify in Review.
-    """
+    """Distribute samples into deck.sections by routing rule:
+       - hosiery   -> ALL BRANDS HOSIERY
+       - accessory -> ALL BRANDS ACCESSORY
+       - cap       -> ALL BRANDS caps
+       - apparel / footwear -> brand-named section (or "Unsorted" if AI
+         couldn't read the brand).
+    Creates sections on demand."""
     by_lower = {s.name.lower(): s for s in deck.sections}
-    unsorted_name = "Unsorted"
     for samp in samples:
-        b = (samp.brand or "").strip()
-        if not b:
-            target_name = unsorted_name
-        else:
-            target_name = b
+        target_name = _target_section_name(samp)
         sec = by_lower.get(target_name.lower())
         if sec is None:
             sec = ReceivedSection(name=target_name)
@@ -463,40 +525,62 @@ def _img_contain(slide, path, l, t, max_w, max_h):
     return slide.shapes.add_picture(path, x, y, new_w, new_h)
 
 
-HEADER_H = Inches(0.55)
+# Header bar measurements — match the reference Wk *.pdf decks. The bar
+# is a consistent height on every slide (so they read as one deck), and
+# the logo/text sits vertically centered with comfortable left padding.
+# 0.65" at the 7.5" slide height is ~8.7% — same proportion as the source.
+HEADER_H        = Inches(0.65)
+HEADER_PAD_X    = Inches(0.25)   # left/right padding inside the bar
+LOGO_BOX_W      = Inches(2.20)   # max width the logo may occupy
+LOGO_BOX_H      = Inches(0.50)   # max height (leaves 0.075" top+bottom)
+LOGO_TOP        = Inches(0.075)  # vertical centering inside the 0.65" bar
+SEASON_BOX_W    = Inches(4.20)
 
 
 def _section_header(slide, section: ReceivedSection, deck: ReceivedDeck):
-    """Black bar across the top. Left: brand logo if available else text
-    label. Right: 'Season: <season>'. Mirrors the reference decks."""
+    """Black bar across the top of every section slide. Left: brand logo
+    if available, else section name as bold white text. Right: 'Season: X'
+    bold white right-aligned. Mirrors the reference decks exactly.
+
+    The bar height (HEADER_H) is constant across every section slide in
+    the deck — that consistency is the look the team is going for. If a
+    section has no logo, the text fallback uses the same vertical center
+    so the header still feels uniform."""
     _box(slide, 0, 0, SW, HEADER_H, P_BLACK)
+
+    # Logo or text on the LEFT
     logo_path = _resolve_brand_logo(section.name, section.logo_override)
     if logo_path:
         try:
             _img_contain(slide, logo_path,
-                         Inches(0.18), Inches(0.05),
-                         Inches(2.4),  Inches(0.45))
+                         HEADER_PAD_X, LOGO_TOP,
+                         LOGO_BOX_W,   LOGO_BOX_H)
         except Exception:
-            # Fall back to text if the logo file is corrupt — never let a
-            # bad asset break the whole build.
+            # Defensive: a corrupt asset must not break the whole deck.
             logo_path = ""
     if not logo_path:
         _txt(slide, section.name or "",
-             Inches(0.18), 0, Inches(8.0), HEADER_H,
-             size=18, bold=True, color=P_CARD,
+             HEADER_PAD_X, 0, Inches(8.0), HEADER_H,
+             size=22, bold=True, color=P_CARD,
              font=HEADER_FONT, align="left", anchor="middle")
-    # Sub-label rides between the logo/title block and the season label —
-    # mirrors the "outerwear" / "HO26 LATE ADDS" notes in the reference.
+
+    # Optional sub-label between the brand block and the season — used
+    # for things like "outerwear" or "HO26 LATE ADDS" in the reference.
     if section.sub_label:
         _txt(slide, section.sub_label,
-             Inches(2.7), 0, Inches(6.0), HEADER_H,
-             size=14, bold=True, color=P_CARD,
+             HEADER_PAD_X + LOGO_BOX_W + Inches(0.30), 0,
+             Inches(6.0), HEADER_H,
+             size=16, bold=True, color=P_CARD,
              font=HEADER_FONT, align="left", anchor="middle")
+
+    # "Season: SPRING 27" on the RIGHT
     season = section.season.strip() or deck.default_season.strip()
-    _txt(slide, f"Season: {season}" if season else "",
-         Inches(9.0), 0, Inches(4.15), HEADER_H,
-         size=14, bold=True, color=P_CARD,
-         font=HEADER_FONT, align="right", anchor="middle")
+    if season:
+        season_left = SW - SEASON_BOX_W - HEADER_PAD_X
+        _txt(slide, f"Season: {season}",
+             season_left, 0, SEASON_BOX_W, HEADER_H,
+             size=16, bold=True, color=P_CARD,
+             font=HEADER_FONT, align="right", anchor="middle")
 
 
 def _build_title_slide(prs, deck: ReceivedDeck):
@@ -1009,8 +1093,20 @@ def _ingest_uploads(label, sec, sec_idx, upl, pending=None):
                              filename=os.path.basename(s["path"]))
         if pending is None and sec is not None:
             # Manual mode: brand is the section name (user already told us).
+            # Set category from the section name so the data stays
+            # internally consistent — if the user later edits via Review
+            # and changes the section, the routing-by-category still works.
             rec.brand = sec.name
             rec.brand_confidence = "HIGH"
+            sname = (sec.name or "").lower()
+            if "hosiery" in sname:
+                rec.category = "hosiery"
+            elif "accessory" in sname:
+                rec.category = "accessory"
+            elif "cap" in sname:
+                rec.category = "cap"
+            else:
+                rec.category = "apparel"
         target_list.append(rec)
 
 
@@ -1103,8 +1199,18 @@ def _show_review():
                                  use_container_width=True):
                         sec.samples.remove(samp)
                         st.rerun()
+                    # Category + low-confidence indicator. Showing the
+                    # AI-detected category lets the user spot a wrongly
+                    # routed sample at a glance (e.g. a sock that landed
+                    # in "Nike" instead of "ALL BRANDS HOSIERY").
+                    if samp.category and samp.category != "unknown":
+                        cat_label = samp.category.upper()
+                    else:
+                        cat_label = "—"
                     if samp.brand_confidence == "LOW":
-                        st.caption("⚠ low brand confidence")
+                        st.caption(f"{cat_label} · ⚠ low confidence")
+                    else:
+                        st.caption(cat_label)
 
     st.write("")
     bL, bR = st.columns([1, 1])
