@@ -79,8 +79,7 @@ COMMON_SECTIONS = [
     "Lacoste",
     "3BRAND",
     "ALL BRANDS HOSIERY",
-    "ALL BRANDS ACCESSORY",
-    "ALL BRANDS caps",
+    "ALL BRANDS ACCESSORIES",
 ]
 
 # Hard caps so a runaway upload doesn't OOM Streamlit. The reference decks
@@ -119,6 +118,73 @@ BODY_FONT   = "Arial"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+# Canonical brand-name aliases. AI brand detection (and user typing) can
+# produce a half-dozen spellings for the same brand — "Nike ACG", "ACG",
+# "ACG by Nike" all refer to one bucket. We normalize to a single
+# canonical spelling so they don't fragment into separate sections.
+# Add new entries here when we see another spelling collision in the wild.
+BRAND_ALIASES = {
+    # ACG (Nike's outdoor line — gets its own section, not "Nike")
+    "nike acg":                "ACG",
+    "acg":                     "ACG",
+    "acg by nike":             "ACG",
+    "acg nike":                "ACG",
+    "nike acg all conditions gear": "ACG",
+    "all conditions gear":     "ACG",
+    # Jordan
+    "jordan":                  "Jordan",
+    "air jordan":              "Jordan",
+    "jumpman":                 "Jordan",
+    "nike jordan":             "Jordan",
+    "jordan brand":            "Jordan",
+    # Nike SB
+    "nike sb":                 "Nike SB",
+    "sb":                      "Nike SB",
+    "nike skateboarding":      "Nike SB",
+    # Ralph Lauren
+    "polo ralph lauren":       "Ralph Lauren",
+    "polo by ralph lauren":    "Ralph Lauren",
+    "ralph lauren polo":       "Ralph Lauren",
+    "polo rl":                 "Ralph Lauren",
+    "rl":                      "Ralph Lauren",
+    "ralph lauren":            "Ralph Lauren",
+    # Common kid/family brand spellings
+    "levis":                   "Levi's",
+    "levi's":                  "Levi's",
+    "carters":                 "Carter's",
+    "carter's":                "Carter's",
+    "osh kosh":                "OshKosh",
+    "oshkosh":                 "OshKosh",
+    "oshkosh b'gosh":          "OshKosh",
+    "cat and jack":            "Cat & Jack",
+    "cat & jack":              "Cat & Jack",
+    "abercrombie & fitch kids":"abercrombie kids",
+    "abercrombie kids":        "abercrombie kids",
+    "hurley":                  "Hurley",
+    "converse":                "Converse",
+    "lacoste":                 "Lacoste",
+    "3brand":                  "3BRAND",
+    "nike":                    "Nike",
+}
+
+
+def _normalize_brand(brand: str) -> str:
+    """Map a raw brand string (AI output or user typing) to its canonical
+    name. Falls back to the original (trimmed) when no alias matches —
+    new brands flow through unchanged so we don't lose anything."""
+    if not brand:
+        return ""
+    key = brand.strip().lower()
+    if key in BRAND_ALIASES:
+        return BRAND_ALIASES[key]
+    # Also try without trailing 's, or with collapsed whitespace, as a
+    # second-chance match for minor variations.
+    alt = re.sub(r"\s+", " ", key).strip()
+    if alt in BRAND_ALIASES:
+        return BRAND_ALIASES[alt]
+    return brand.strip()
+
+
 def _slugify_section_name(name: str) -> str:
     """Lowercase + collapse non-alphanumeric runs to underscores. Used to
     resolve a section's brand-logo file: `assets/brand_logos/<slug>.png`."""
@@ -301,11 +367,13 @@ def _brand_detect_call(client, model_id, image_path, candidate_brands):
     if candidate_brands:
         clean = ", ".join(b for b in candidate_brands if b.strip())
         candidates_clause = (
-            f"\nThe user has already set up these brand sections in this "
-            f"deck: [{clean}]. If the brand on this photo clearly matches "
-            f"one of those names (case-insensitive), return that exact "
-            f"spelling so we can group photos together. Otherwise return "
-            f"the brand as you read it from the photo."
+            f"\nSPELLING CONSISTENCY: the deck already has these brand "
+            f"sections: [{clean}]. If you READ a brand on the photo that "
+            f"matches one of those (case-insensitive), use that exact "
+            f"spelling so the photo joins the existing section. This list "
+            f"is for SPELLING ONLY — never assign a brand from this list "
+            f"unless you can actually read it on the photo. If you can't "
+            f"read a brand, the answer is 'unknown', NOT one of these."
         )
     prompt = (
         "Identify both the BRAND and the CATEGORY of the sample in this "
@@ -316,18 +384,27 @@ def _brand_detect_call(client, model_id, image_path, candidate_brands):
         "text or logo is clearly readable. Do not infer the brand from "
         "garment style.\n\n"
         "SUB-BRANDS: Some labels live under a parent brand but ship as "
-        "their own distinct collection. Treat these as their OWN brand, "
-        "NOT as the parent — even when 'Nike' also appears on the tag:\n"
-        "  - ACG (Nike's outdoor line — triangle logo, often paired with "
-        "small 'NIKE' wordmark) → return 'ACG'\n"
-        "  - Jordan (Jumpman silhouette, AIR JORDAN wordmark) → return "
-        "'Jordan'\n"
-        "  - Nike SB (skateboarding line) → return 'Nike SB'\n"
-        "  - Hurley → return 'Hurley'\n"
-        "  - Converse → return 'Converse'\n"
-        "If you see ACG branding, return 'ACG' regardless of any 'Nike' "
-        "text elsewhere on the tag. Only return 'Nike' for plain Nike "
-        "items (swoosh, NIKE wordmark, no sub-brand marker).\n\n"
+        "their own distinct collection. Return the SUB-BRAND name only "
+        "when its own mark is LITERALLY VISIBLE on the photo — never "
+        "infer a sub-brand from style, color, or vibe. When in doubt, "
+        "return the parent brand (or 'unknown').\n"
+        "  - ACG → return 'ACG' ONLY when you can clearly see one of: "
+        "the letters 'ACG', the ACG triangle logo, or the phrase 'All "
+        "Conditions Gear'. Tactical/outdoor styling is NOT enough. If "
+        "the only ACG-related signal is your assumption, return 'Nike' "
+        "(or the actual visible brand). Do NOT return 'ACG' for "
+        "non-Nike items — Ralph Lauren, Polo, Carter's etc. are NEVER "
+        "ACG no matter what they look like.\n"
+        "  - Jordan → return 'Jordan' only when the Jumpman silhouette "
+        "or 'AIR JORDAN' wordmark is visible.\n"
+        "  - Nike SB → return 'Nike SB' only when 'SB' is visible on "
+        "the tag/logo.\n"
+        "Return 'Nike' (no sub-brand) for plain Nike items: swoosh "
+        "alone, plain NIKE wordmark, no sub-brand marker visible.\n\n"
+        "BRAND IDENTIFICATION RULE — read it or skip it. If you cannot "
+        "literally READ a brand name or RECOGNIZE a logo on the photo, "
+        "return brand='unknown'. Never guess based on garment style, "
+        "color, fabric, or because it 'looks like' a brand.\n\n"
         "CATEGORY: classify the item itself, NOT the brand. Use exactly "
         "one of these values:\n"
         "  - apparel    = tops, bottoms, dresses, sets, outerwear, "
@@ -383,6 +460,10 @@ def _brand_detect_call(client, model_id, image_path, candidate_brands):
         conf = "MEDIUM"
     if brand.lower() == "unknown":
         brand = ""
+    # Canonicalize: "Nike ACG", "ACG by Nike" → "ACG"; "Polo Ralph Lauren"
+    # → "Ralph Lauren"; "Levis" → "Levi's"; etc. Done as the last step so
+    # the rest of the pipeline only ever sees the canonical spelling.
+    brand = _normalize_brand(brand)
     return brand, category, conf, cost
 
 
@@ -419,13 +500,15 @@ def _detect_brands_for_samples(client, model_id, samples,
     return total_cost
 
 
-# Cross-brand category sections — these match the reference deck layout
-# where Nike, Jordan, and adidas socks all collect on the same hosiery
-# pages rather than under their respective brand sections.
+# Cross-brand category sections — accessories of all kinds (bags, caps,
+# belts, hats, etc.) collapse into ONE "ALL BRANDS ACCESSORIES" bucket,
+# matching how the team wants the deck organized. Hosiery is still its
+# own bucket because the reference decks separate socks from accessories
+# (sock displays vs. bag/belt/cap displays).
 ALL_BRANDS_SECTIONS = {
     "hosiery":   "ALL BRANDS HOSIERY",
-    "accessory": "ALL BRANDS ACCESSORY",
-    "cap":       "ALL BRANDS caps",
+    "accessory": "ALL BRANDS ACCESSORIES",
+    "cap":       "ALL BRANDS ACCESSORIES",
 }
 
 
@@ -1185,10 +1268,10 @@ def _ingest_uploads(label, sec, sec_idx, upl, pending=None):
             sname = (sec.name or "").lower()
             if "hosiery" in sname:
                 rec.category = "hosiery"
-            elif "accessory" in sname:
+            elif "accessor" in sname or "cap" in sname:
+                # Caps now ride with accessories per the new spec — one
+                # "ALL BRANDS ACCESSORIES" bucket holds bags + caps + belts.
                 rec.category = "accessory"
-            elif "cap" in sname:
-                rec.category = "cap"
             else:
                 rec.category = "apparel"
         target_list.append(rec)
