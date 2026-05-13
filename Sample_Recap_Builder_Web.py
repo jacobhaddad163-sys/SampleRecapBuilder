@@ -1626,7 +1626,15 @@ def build_sample_slide(prs, deck, sample, extra_images=None):
             details_lines.append(f"Fabric: {sample.fabric}")
         # AI-generated details only render at HIGH confidence — when not 100%
         # visible we'd rather show nothing than risk a wrong description.
-        if sample.details and is_high_conf:
+        # The sidebar "Include AI product description" toggle suppresses this
+        # line deck-wide without clearing the per-sample field, so re-enabling
+        # is a single click rather than another analysis pass.
+        include_details = True
+        try:
+            include_details = bool(st.session_state.get("include_details", True))
+        except Exception:
+            pass
+        if sample.details and is_high_conf and include_details:
             details_lines.append(sample.details)
         if sample.notes:
             details_lines.append(sample.notes)
@@ -1793,6 +1801,12 @@ def init_state():
         # than it fixes. The per-sample rotate buttons in the Review step are
         # the reliable path. Users can opt in via the Analyze step checkbox.
         st.session_state.auto_rotate = False
+    if "include_details" not in st.session_state:
+        # Default ON to preserve existing deck behavior. User can disable
+        # from the sidebar to drop the AI-extracted "notable features" line
+        # from every sample slide in one click — useful when descriptions
+        # are noisy or when the team prefers a cleaner, fields-only slide.
+        st.session_state.include_details = True
 
 
 def go(step):
@@ -1833,6 +1847,16 @@ def show_sidebar():
             label_visibility="collapsed",
         )
         st.session_state.model_name = model
+        st.markdown("---")
+        st.markdown("**Slide content**")
+        st.session_state.include_details = st.checkbox(
+            "Include AI product description",
+            value=st.session_state.get("include_details", True),
+            help="When on, each sample slide prints the AI-extracted "
+                 "'notable features' line (e.g. 'Drop-shoulder oversized fit'). "
+                 "Turn off for a cleaner slide that only shows the structured "
+                 "fields. Affects every slide in the deck. Colorways, fabric, "
+                 "and any notes you typed in still print.")
         st.markdown("---")
         if st.button("↻ Start over", use_container_width=True):
             for k in list(st.session_state.keys()):
@@ -2591,9 +2615,15 @@ def show_build():
             go("catalog")
 
 
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="🧷")
-    st.markdown(APP_CSS, unsafe_allow_html=True)
+def render_sbs_tab():
+    """Render the existing Sample Recap Builder (SBS) flow inside its tab.
+
+    This is everything that used to live in main(), minus the page-level
+    `st.set_page_config` and CSS injection — those now run once at the entry
+    point and apply to every tab. Initialising session_state, the sidebar,
+    the step indicator, and dispatching to the active step all stay scoped
+    to this function so a user switching tabs doesn't disturb the flow.
+    """
     init_state()
     show_sidebar()
     show_nav()
@@ -2611,6 +2641,28 @@ def main():
         show_build()
     else:
         show_setup()
+
+
+def main():
+    """Entry point. Sets page config once, injects shared CSS, then renders
+    the two top-level tabs. Each tab's body is fully isolated:
+      - SBS uses unprefixed session_state keys (legacy).
+      - Received Samples uses `rs_*` prefixed keys — see received_samples_tab.
+
+    The `received_samples_tab` import is deferred to break a potential
+    circular import (the RS module imports utilities from this module).
+    """
+    st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="🧷")
+    st.markdown(APP_CSS, unsafe_allow_html=True)
+    tab_sbs, tab_rs = st.tabs([
+        "Sample Recap Builder",
+        "Received Samples Deck Builder",
+    ])
+    with tab_sbs:
+        render_sbs_tab()
+    with tab_rs:
+        import received_samples_tab  # lazy: avoids circular import
+        received_samples_tab.render_tab()
 
 
 if __name__ == "__main__":
