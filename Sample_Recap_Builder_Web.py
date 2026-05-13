@@ -664,7 +664,8 @@ NEVER invent a price. Empty string is acceptable when no price is visible.
 CRITICAL: Exactly {batch_size} objects in order, matching the photos one-for-one."""
 
 
-def _run_analysis_batch(client, model_id, samples, presenter_name, default_bought_from=""):
+def _run_analysis_batch(client, model_id, samples, presenter_name,
+                        default_bought_from="", auto_rotate=False):
     if not samples:
         return 0.0
     content = []
@@ -728,14 +729,21 @@ def _run_analysis_batch(client, model_id, samples, presenter_name, default_bough
                 pr = (info.get("price") or "").strip()
                 if pr and not rec.price:
                     rec.price = pr
-                # ── Auto-rotate the photo if the AI says it's misoriented.
-                # The model returns the CW degrees needed to make the garment
-                # right-side-up. We apply it directly to the on-disk preview.
+                # ── Optional auto-rotate: only when the user has opted in via
+                # the "Auto-rotate photos" checkbox in the Analyze step.
+                # LLM orientation judgment on flat-lay apparel is unreliable
+                # enough — even with Stage 4 verification — that running it
+                # by default produced more wrong-orientation slides than the
+                # rare sideways camera capture it was meant to fix. The
+                # per-sample rotate buttons in the Review step are the
+                # reliable path. Stage 2 still reads rotation_confidence so
+                # we can flag low-confidence rows for review even when we
+                # don't auto-apply a rotation.
                 try:
                     rot_raw = info.get("rotation_degrees", 0)
                     rot = int(rot_raw) if rot_raw not in (None, "") else 0
                     rot = rot % 360
-                    if rot in (90, 180, 270):
+                    if auto_rotate and rot in (90, 180, 270):
                         rotate_image_file(rec.preview_path, rot)
                     rec.rotation_confidence = (
                         info.get("rotation_confidence") or "HIGH"
@@ -971,7 +979,8 @@ def auto_verify_orientation(client, model_id, samples, on_progress=None):
     return total_cost
 
 
-def analyze_presenter_samples(client, model_id, presenter, on_progress=None):
+def analyze_presenter_samples(client, model_id, presenter, on_progress=None,
+                              auto_rotate=False):
     BATCH_SIZE = 6
     # Per-presenter Stage-2 batch concurrency. With show_analyze running up to
     # 3 presenters in parallel, the global Stage-2 ceiling is 3*3 = 9 in-flight
@@ -989,7 +998,8 @@ def analyze_presenter_samples(client, model_id, presenter, on_progress=None):
         for s, e in ranges:
             futures.append(pool.submit(
                 _run_analysis_batch, client, model_id,
-                presenter.samples[s:e], presenter.name, presenter.bought_from_hint))
+                presenter.samples[s:e], presenter.name,
+                presenter.bought_from_hint, auto_rotate))
         for fut in as_completed(futures):
             try:
                 total_cost += fut.result() or 0.0
@@ -1021,7 +1031,8 @@ def analyze_presenter_samples(client, model_id, presenter, on_progress=None):
                     r.analysis_error = ""
                 retry_futs.append(pool.submit(
                     _run_analysis_batch, client, model_id,
-                    failed[s:e], presenter.name, presenter.bought_from_hint))
+                    failed[s:e], presenter.name,
+                    presenter.bought_from_hint, auto_rotate))
             for fut in as_completed(retry_futs):
                 try:
                     total_cost += fut.result() or 0.0
@@ -1030,21 +1041,23 @@ def analyze_presenter_samples(client, model_id, presenter, on_progress=None):
                 except Exception as ex:
                     logging.warning("retry batch error: %s", ex)
 
-    # Stage 4: targeted orientation verification on suspect photos. Only runs
-    # on samples Stage 2 wasn't confident about or whose post-rotation aspect
-    # ratio doesn't match the predicted category. For a typical 30-photo
-    # presenter this is usually 0–3 photos and adds ~1–2s + a few cents.
-    try:
-        verify_cost = auto_verify_orientation(
-            client, model_id, presenter.samples,
-            on_progress=(
-                lambda d, t: on_progress(len(ranges), len(ranges),
-                                          f"{presenter.name} (verifying {d}/{t})")
-                if on_progress else None))
-        total_cost += verify_cost or 0.0
-    except Exception as ex:
-        logging.warning("orientation verification stage failed for %s: %s",
-                        presenter.name, ex)
+    # Stage 4: targeted orientation verification. Only runs when the user
+    # opted into auto-rotation — without auto_rotate, we don't touch photo
+    # orientation at all (LLM orientation calls on flat-lay apparel were
+    # producing more wrong-orientation slides than they fixed). The
+    # per-sample rotate buttons in Review are the reliable path.
+    if auto_rotate:
+        try:
+            verify_cost = auto_verify_orientation(
+                client, model_id, presenter.samples,
+                on_progress=(
+                    lambda d, t: on_progress(len(ranges), len(ranges),
+                                              f"{presenter.name} (verifying {d}/{t})")
+                    if on_progress else None))
+            total_cost += verify_cost or 0.0
+        except Exception as ex:
+            logging.warning("orientation verification stage failed for %s: %s",
+                            presenter.name, ex)
     return total_cost
 
 
@@ -1782,6 +1795,12 @@ def init_state():
         st.session_state._seen_hashes = {}
     if "auto_merge_duplicates" not in st.session_state:
         st.session_state.auto_merge_duplicates = False
+    if "auto_rotate" not in st.session_state:
+        # OFF by default. AI orientation judgment on flat-lay apparel is
+        # unreliable enough that on average it introduces more wrong rotations
+        # than it fixes. The per-sample rotate buttons in the Review step are
+        # the reliable path. Users can opt in via the Analyze step checkbox.
+        st.session_state.auto_rotate = False
     if "include_details" not in st.session_state:
         # Default ON to preserve existing deck behavior. User can disable
         # from the sidebar to drop the AI-extracted "notable features" line
@@ -2078,6 +2097,20 @@ def show_analyze():
              "the same physical garment from different angles, and merges them. "
              "You can still manually adjust in the Review step.")
 
+    # Auto-rotate toggle — opt-in. AI orientation judgment on flat-lay
+    # apparel is unreliable enough that defaulting it ON produced more
+    # wrong-orientation slides than it fixed. Left off, photos stay as
+    # uploaded (with EXIF orientation already applied) and the Review step
+    # has rotate buttons for the few that need fixing.
+    st.session_state.auto_rotate = st.checkbox(
+        "🔄 Auto-rotate sideways/upside-down photos (experimental — can be wrong)",
+        value=st.session_state.auto_rotate,
+        help="Asks Claude to detect the garment's natural top and rotates the "
+             "photo to match. WARNING: on flat-lay apparel this is often wrong "
+             "(can flip a correct photo upside-down). Leave OFF and use the "
+             "rotate buttons in the Review step for the few photos that come "
+             "in sideways from the camera. Adds ~1 API call per apparel photo.")
+
     st.write("")
     bL, bR = st.columns([1, 1])
     with bL:
@@ -2127,9 +2160,11 @@ def show_analyze():
         try:
             start_time = time.time()
             with ThreadPoolExecutor(max_workers=PRESENTER_CONCURRENCY) as pool:
+                auto_rotate_flag = st.session_state.get("auto_rotate", False)
                 futures = {
                     pool.submit(analyze_presenter_samples, client, model_id, p,
-                                make_progress_cb(p)): p
+                                make_progress_cb(p),
+                                auto_rotate=auto_rotate_flag): p
                     for p in presenters_with_samples
                 }
                 pending = set(futures.keys())
