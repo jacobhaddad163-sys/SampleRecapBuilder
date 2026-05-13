@@ -1815,7 +1815,10 @@ def go(step):
 
 
 def show_nav():
-    steps = [("setup", "Setup"), ("presenters", "Presenters"),
+    # Setup step is intentionally hidden from the visible stepper — when the
+    # API key is in secrets it's skipped automatically; when it's not, the
+    # user lands directly on it and the nav context doesn't help yet.
+    steps = [("presenters", "Presenters"),
              ("analyze", "Analyze"), ("catalog", "Review"), ("build", "Build")]
     cur_i = next((i for i, (k, _) in enumerate(steps) if k == st.session_state.step), 0)
     cols = st.columns(len(steps))
@@ -1867,6 +1870,13 @@ def show_sidebar():
 
 
 def show_setup():
+    # When the API key is configured in secrets, the Setup screen has no
+    # value — it's just a "Continue" button. Skip it entirely.
+    api_key_in_secrets = bool(_get_secret("ANTHROPIC_API_KEY", ""))
+    if api_key_in_secrets:
+        go("presenters")
+        return
+
     st.markdown(
         '<div class="srb-hero">'
         '<h1>SAMPLE RECAP BUILDER</h1>'
@@ -1874,13 +1884,6 @@ def show_setup():
         'upload, AI-classify, sort by Category › Brand › Gender, export PPTX.</p>'
         '</div>', unsafe_allow_html=True)
     st.write("")
-    api_key_in_secrets = bool(_get_secret("ANTHROPIC_API_KEY", ""))
-
-    if api_key_in_secrets:
-        st.success("Anthropic API key loaded from secrets — you're ready to go.")
-        if st.button("Continue", type="primary"):
-            go("presenters")
-        return
 
     with st.container():
         st.markdown('<div class="srb-card">', unsafe_allow_html=True)
