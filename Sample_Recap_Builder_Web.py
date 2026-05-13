@@ -2580,9 +2580,15 @@ def show_build():
             go("catalog")
 
 
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="🧷")
-    st.markdown(APP_CSS, unsafe_allow_html=True)
+def render_sbs_tab():
+    """Render the existing Sample Recap Builder (SBS) flow inside its tab.
+
+    This is everything that used to live in main(), minus the page-level
+    `st.set_page_config` and CSS injection — those now run once at the entry
+    point and apply to every tab. Initialising session_state, the sidebar,
+    the step indicator, and dispatching to the active step all stay scoped
+    to this function so a user switching tabs doesn't disturb the flow.
+    """
     init_state()
     show_sidebar()
     show_nav()
@@ -2600,6 +2606,28 @@ def main():
         show_build()
     else:
         show_setup()
+
+
+def main():
+    """Entry point. Sets page config once, injects shared CSS, then renders
+    the two top-level tabs. Each tab's body is fully isolated:
+      - SBS uses unprefixed session_state keys (legacy).
+      - Received Samples uses `rs_*` prefixed keys — see received_samples_tab.
+
+    The `received_samples_tab` import is deferred to break a potential
+    circular import (the RS module imports utilities from this module).
+    """
+    st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="🧷")
+    st.markdown(APP_CSS, unsafe_allow_html=True)
+    tab_sbs, tab_rs = st.tabs([
+        "Sample Recap Builder",
+        "Received Samples Deck Builder",
+    ])
+    with tab_sbs:
+        render_sbs_tab()
+    with tab_rs:
+        import received_samples_tab  # lazy: avoids circular import
+        received_samples_tab.render_tab()
 
 
 if __name__ == "__main__":
