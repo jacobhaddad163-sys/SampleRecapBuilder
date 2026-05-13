@@ -1769,7 +1769,7 @@ section[data-testid="stSidebar"] h3 { color: #F2F0EB !important; }
 
 def init_state():
     if "step" not in st.session_state:
-        st.session_state.step = "setup"
+        st.session_state.step = "presenters" if _get_anthropic_api_key() else "setup"
     if "deck" not in st.session_state:
         d = MeetingDeck()
         try:
