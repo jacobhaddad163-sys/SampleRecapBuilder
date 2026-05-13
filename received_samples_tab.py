@@ -70,6 +70,8 @@ BRAND_LOGOS_DIR = os.path.join(ASSETS_DIR, "brand_logos")
 COMMON_SECTIONS = [
     "Jordan",
     "Nike",
+    "ACG",
+    "Nike SB",
     "Hurley",
     "Converse",
     "Levi's",
@@ -313,6 +315,19 @@ def _brand_detect_call(client, model_id, image_path, candidate_brands):
         "read it from the photo (title case). Use 'unknown' if no brand "
         "text or logo is clearly readable. Do not infer the brand from "
         "garment style.\n\n"
+        "SUB-BRANDS: Some labels live under a parent brand but ship as "
+        "their own distinct collection. Treat these as their OWN brand, "
+        "NOT as the parent — even when 'Nike' also appears on the tag:\n"
+        "  - ACG (Nike's outdoor line — triangle logo, often paired with "
+        "small 'NIKE' wordmark) → return 'ACG'\n"
+        "  - Jordan (Jumpman silhouette, AIR JORDAN wordmark) → return "
+        "'Jordan'\n"
+        "  - Nike SB (skateboarding line) → return 'Nike SB'\n"
+        "  - Hurley → return 'Hurley'\n"
+        "  - Converse → return 'Converse'\n"
+        "If you see ACG branding, return 'ACG' regardless of any 'Nike' "
+        "text elsewhere on the tag. Only return 'Nike' for plain Nike "
+        "items (swoosh, NIKE wordmark, no sub-brand marker).\n\n"
         "CATEGORY: classify the item itself, NOT the brand. Use exactly "
         "one of these values:\n"
         "  - apparel    = tops, bottoms, dresses, sets, outerwear, "
@@ -730,9 +745,78 @@ def _show_setup():
 
 
 # ── UI: Step 2 — Sections (manual + bulk modes) ─────────────────────────────
+def _show_brand_logo_library():
+    """Collapsible UI for managing the persistent brand-logo library at
+    assets/brand_logos/. Logos uploaded here are written under their
+    slugified name and survive across sessions, so the user only ever
+    has to upload a given brand's logo once. Replaces the previous
+    workflow of dropping PNGs into the folder by hand."""
+    import os
+    import glob
+    with st.expander("📚 Brand Logo Library — upload once, reuse forever",
+                     expanded=False):
+        st.caption(
+            "Logos saved here are matched to your sections by name. Drop a "
+            "PNG and pick which brand it represents — we save it as "
+            "`assets/brand_logos/<slug>.png` and every future deck that uses "
+            "that brand will pick it up automatically.")
+
+        existing = sorted(glob.glob(os.path.join(BRAND_LOGOS_DIR, "*.png")))
+        if existing:
+            st.caption("Currently in library:")
+            cols = st.columns(min(6, max(1, len(existing))))
+            for j, f in enumerate(existing):
+                with cols[j % len(cols)]:
+                    try:
+                        st.image(f, caption=os.path.basename(f),
+                                 use_container_width=True)
+                    except Exception:
+                        st.caption(f"_{os.path.basename(f)}_")
+                    if st.button("Delete", key=f"rs_lib_del_{j}",
+                                 use_container_width=True):
+                        try:
+                            os.remove(f)
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"Couldn't delete: {ex}")
+        else:
+            st.caption("_Library is empty._")
+
+        st.markdown("**Upload a new logo**")
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            brand_name = st.text_input(
+                "Brand name", value="",
+                placeholder="e.g. Hurley",
+                help="The exact brand spelling. We'll slugify it for the "
+                     "filename (e.g. 'Hurley' → hurley.png).",
+                key="rs_lib_brand_in")
+        with c2:
+            up = st.file_uploader(
+                "PNG file (white logo on transparent background works best)",
+                type=["png"], accept_multiple_files=False,
+                key="rs_lib_up")
+        if up is not None and brand_name.strip():
+            slug = _slugify_section_name(brand_name)
+            if not slug:
+                st.error("Couldn't derive a slug from that brand name.")
+            else:
+                dest = os.path.join(BRAND_LOGOS_DIR, f"{slug}.png")
+                try:
+                    with open(dest, "wb") as fh:
+                        fh.write(up.read())
+                    st.success(f"Saved → {os.path.basename(dest)}")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Couldn't save: {ex}")
+        elif up is not None and not brand_name.strip():
+            st.warning("Enter a brand name above before saving.")
+
+
 def _show_sections():
     deck = st.session_state.rs_deck
     st.markdown("### Sections & photos")
+    _show_brand_logo_library()
     st.caption("Each section becomes a header on its own slides. Pick a mode:")
 
     mode = st.radio(
