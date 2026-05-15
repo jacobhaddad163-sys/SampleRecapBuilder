@@ -189,6 +189,11 @@ class SampleRecord:
         # primary. merge_with_previous remains as the catalog checkbox
         # state; merge_into is the source of truth for build_deck.
         self.merge_into = ""
+        # Set to True by AI when the photo is a rack/grid overview shot
+        # (multiple garments hanging together). These are pulled out after
+        # analysis and shown on the presenter cover slide instead of becoming
+        # individual sample slides.
+        self.is_grid_photo = False
 
 
 class PresenterConfig:
@@ -196,6 +201,7 @@ class PresenterConfig:
         self.name        = name
         self.samples     = []   # list of SampleRecord
         self.bought_from_hint = ""  # optional default if presenter has a single source
+        self.grid_photo_paths = []  # paths of rack overview photos (AI-detected)
 
 
 class MeetingDeck:
@@ -609,16 +615,18 @@ ROTATION DETECTION — STEP BY STEP:
 
     return f"""Presenter: {presenter_name}.{bought_hint}
 
-Analyze each of the {batch_size} sample photos above IN ORDER. Each photo shows a single
-store-bought apparel sample. Read EVERY tag, label, sticker, and visible logo.
+Analyze each of the {batch_size} sample photos above IN ORDER. Photos are either rack/grid
+overview shots (multiple garments hanging on a rack or grid wall) or individual product
+shots (one garment laid flat, held up, or on a hanger alone).
 Return a JSON object with exactly {batch_size} entries:
 
 {{"samples": [
   {{{rotation_fields}
-    "garment_colors": ["UP TO 6 hex color codes (#RRGGBB) for the ACTUAL GARMENT'S colors — fabric, prints, embroidery, trim. EXCLUDE backdrop, shadows, hangtags. Order by prominence. Even solids have 2-3 tones (highlight/mid/shadow)."],
+    "is_grid": "true if this photo shows MULTIPLE garments hanging on a rack, grid wall, or display fixture — an overview/context shot of the full haul. false if it shows a single individual product (flat lay, single hanger, or close-up of one item). When true, all other fields below can be empty.",
+    "garment_colors": ["UP TO 6 hex color codes (#RRGGBB) for the ACTUAL GARMENT'S colors — fabric, prints, embroidery, trim. EXCLUDE backdrop, shadows, hangtags. Order by prominence. Even solids have 2-3 tones (highlight/mid/shadow). Empty list if is_grid is true."],
     "brand": "PRODUCT BRAND in CAPS — the MANUFACTURER/label brand, NOT the store. ONLY return a brand you can READ directly from a hangtag, neck label, sewn-in label, screen-printed logo, embroidered logo, or packaging — clearly and unambiguously. If partially obscured, blurry, or inferred from style/retailer — RETURN EMPTY STRING. Examples (only if literally visible): NIKE, JORDAN, CONVERSE, HURLEY, LEVI'S, LACOSTE, POLO, ADIDAS, PUMA, GAP, OLD NAVY, PRIMARK, H&M, CAT & JACK, WONDER NATION, GARANIMALS, CARTER'S, OSHKOSH, 3BRAND, ROXY, QUIKSILVER. WHEN IN DOUBT, RETURN EMPTY STRING.",
-    "category": "EXACTLY ONE OF: {cat_str}. See category definitions below.",
-    "gender": "EXACTLY ONE OF: {gender_str}. Determine from sizing tag, styling, packaging.",
+    "category": "EXACTLY ONE OF: {cat_str}. See category definitions below. Empty if is_grid is true.",
+    "gender": "EXACTLY ONE OF: {gender_str}. Determine from sizing tag, styling, packaging. Empty if is_grid is true.",
     "product": "Short PO-style label. e.g. 'S/S Tee', 'L/S Tee', 'Polo S/S', 'Tank Top', 'Fleece Hoody', 'Zip Hoody', 'Crewneck Sweatshirt', 'Mesh Short', 'Sweat Short', 'Denim Jean', 'Fleece Jogger', 'Puffer Jacket', 'Bomber Jacket'. Under 6 words. NEVER use 'Leg Warmers', 'Thermal Underwear', 'Diaper Cover', 'Long Underwear', or obscure labels unless the hangtag literally says so.",
     "colorways": "Plain-language color description. e.g. 'Black, Cream' or 'Tie-dye Pink'.",
     "fabric": "Material if labeled. e.g. '100% Cotton', 'Polyester Fleece'. Empty if not visible.",
@@ -712,6 +720,7 @@ def _run_analysis_batch(client, model_id, samples, presenter_name,
                 if j >= len(samples):
                     break
                 rec = samples[j]
+                rec.is_grid_photo = str(info.get("is_grid", "false")).strip().lower() in ("true", "yes", "1")
                 rec.brand       = (info.get("brand") or "").strip().upper()
                 rec.category    = normalize_category(info.get("category"))
                 rec.gender      = normalize_gender(info.get("gender"))
@@ -1454,17 +1463,23 @@ def build_presenter_cover(prs, presenter, deck):
     s = _blank_slide(prs)
     _bg(s, P_BLACK)
     _header_bar(s, deck, f"{presenter.name.upper()} — GRID")
-    _txt(s, presenter.name.upper(),
-         Inches(0.5), Inches(2.6), Inches(12.33), Inches(1.6),
-         size=72, bold=False, color=P_CARD,
-         font=TITLE_FONT, align="center", anchor="middle")
-    _txt(s, "GRID",
-         Inches(0.5), Inches(4.2), Inches(12.33), Inches(0.6),
-         size=30, bold=False, color=P_CARD,
-         font=TITLE_FONT, align="center", anchor="middle")
+    # Show the rack overview photo(s) in the main area
+    photos = [p for p in (presenter.grid_photo_paths or []) if p and os.path.exists(p)]
+    if photos:
+        _draw_image_card(s, photos[:4], Inches(0.4), Inches(0.75), Inches(12.53), Inches(6.35))
+    else:
+        # Fallback if no photos: text-only layout
+        _txt(s, presenter.name.upper(),
+             Inches(0.5), Inches(2.6), Inches(12.33), Inches(1.6),
+             size=72, bold=False, color=P_CARD,
+             font=TITLE_FONT, align="center", anchor="middle")
+        _txt(s, "GRID",
+             Inches(0.5), Inches(4.2), Inches(12.33), Inches(0.6),
+             size=30, bold=False, color=P_CARD,
+             font=TITLE_FONT, align="center", anchor="middle")
     _txt(s, deck.meeting_date or "",
-         Inches(0.5), Inches(4.9), Inches(12.33), Inches(0.4),
-         size=14, bold=True, color=RGBColor(0xC8, 0xC4, 0xBC),
+         Inches(0.5), Inches(7.1), Inches(12.33), Inches(0.3),
+         size=11, bold=False, color=RGBColor(0xC8, 0xC4, 0xBC),
          font=HEADER_FONT, align="center", anchor="middle")
 
 
@@ -1711,9 +1726,9 @@ def build_deck(deck, output_path, on_progress=None):
         sorted_samples = sort_samples(p.samples)
         groups = resolve_merge_groups(sorted_samples)
 
-        # Only include the "GRID" presenter cover when at least one merged
-        # group actually has multiple photos — otherwise the cover is noise.
-        if any(extras for _, extras in groups):
+        # Only include the "GRID" presenter cover when the presenter has
+        # rack overview photos (AI-detected during analysis).
+        if getattr(p, "grid_photo_paths", None):
             build_presenter_cover(prs, p, deck)
 
         for primary, extras in groups:
@@ -2195,6 +2210,14 @@ def show_analyze():
                         progress.progress(
                             min(0.99, 0.95 + 0.04 * dup_done / len(dup_futs)),
                             text=f"Duplicate detection {dup_done}/{len(dup_futs)} presenters")
+
+            # Separate rack/grid overview photos from individual sample photos.
+            # Grid photos are shown on the presenter cover slide; individual
+            # samples proceed through catalog and build as normal.
+            for p in presenters_with_samples:
+                grids = [r for r in p.samples if r.is_grid_photo]
+                p.samples = [r for r in p.samples if not r.is_grid_photo]
+                p.grid_photo_paths = [r.preview_path for r in grids]
 
             progress.progress(1.0, text=f"Done. Estimated cost ≈ ${total_cost:.3f}")
             elapsed_total = time.time() - start_time
