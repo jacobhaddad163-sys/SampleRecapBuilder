@@ -576,66 +576,64 @@ ANALYSIS_SYSTEM = (
 )
 
 
-def _build_analysis_prompt(presenter_name, batch_size, default_bought_from=""):
+def _build_analysis_prompt(presenter_name, batch_size, default_bought_from="",
+                           include_rotation=True):
     cat_str = ", ".join(CATEGORY_ORDER)
     gender_str = ", ".join(GENDER_ORDER)
     bought_hint = (
         f"\nIf no store name is visible, you MAY default to '{default_bought_from}' (the "
         f"presenter's noted source). Otherwise leave bought_from empty."
     ) if default_bought_from else ""
+
+    rotation_fields = """
+    "rotation_degrees": "INTEGER 0, 90, 180, or 270. How many degrees CLOCKWISE the image needs to rotate so the garment appears upright. 0=correct. 90=top-of-garment on the right. 180=upside-down. 270=top-of-garment on the left. Judge from neckline/collar position, waistband, readable text.",
+    "rotation_confidence": "HIGH or LOW. HIGH only when you can clearly identify the natural top (neckline, waistband, readable text/logo, hanger). LOW when ambiguous or uncertain.",""" if include_rotation else ""
+
+    rotation_section = """
+ROTATION DETECTION — STEP BY STEP:
+1. Find the garment's anatomical reference points:
+   - Tops/Outerwear/Sets/Sleepwear: neckline/shoulders → TOP. Hem → BOTTOM.
+   - Bottoms: waistband → TOP. Leg openings → BOTTOM.
+   - Dresses/Rompers: straps/neckline → TOP. Hem → BOTTOM.
+   - Swimwear: straps/waistband → TOP. Leg openings → BOTTOM.
+   - Footwear: toe → LEFT or RIGHT. Heel opposite.
+   - Accessories: wearable opening → BOTTOM. Logo text reads left-to-right.
+2. Where are those reference points in the photo?
+   - Natural-top on RIGHT → rotated CCW, answer 90.
+   - Natural-top on LEFT  → rotated CW,  answer 270.
+   - Natural-top at BOTTOM → upside-down, answer 180.
+   - Natural-top at TOP    → correct, answer 0.
+3. Any text/logo should read horizontally left-to-right when oriented correctly.
+4. No clear top/bottom → default 0, do NOT guess.
+""" if include_rotation else ""
+
     return f"""Presenter: {presenter_name}.{bought_hint}
 
 Analyze each of the {batch_size} sample photos above IN ORDER. Each photo shows a single
-store-bought apparel sample being presented at a sample meeting. Read EVERY tag, label,
-sticker, and visible logo. Also evaluate the photo's ORIENTATION and the GARMENT'S COLORS.
+store-bought apparel sample. Read EVERY tag, label, sticker, and visible logo.
 Return a JSON object with exactly {batch_size} entries:
 
 {{"samples": [
-  {{
-    "rotation_degrees": "INTEGER 0, 90, 180, or 270. How many degrees the image needs to be rotated CLOCKWISE so the garment appears in its natural upright orientation. 0 = already correct. 90 = the photo is currently rotated 90° counter-clockwise (sideways with top-of-garment on the right) and needs +90 CW to fix. 180 = upside-down. 270 = rotated 90° clockwise (top-of-garment on the left) and needs 270 CW (i.e. -90) to fix. JUDGE FROM: position of neckline/collar (should be at top), readability of any text on the garment or tag, position of waistband/hem (should be at bottom). For sweatshirts/tees the neckline/shoulder area should be at the TOP of the photo. For bottoms the waistband should be at TOP. For dresses the shoulders/neckline at TOP. If unclear, return 0.",
-    "rotation_confidence": "HIGH or LOW. HIGH only when you can clearly identify the garment's natural top from a confident reference point (visible neckline, waistband, readable text/logo, hanger). LOW when the garment is ambiguous (square fold, unusual silhouette, no clear reference point) OR when the rotation might be wrong. A LOW rating triggers a more careful verification pass downstream — be honest, not optimistic.",
-    "garment_colors": ["UP TO 6 hex color codes (#RRGGBB) representing the ACTUAL GARMENT'S colors — the fabric, prints, embroidery, and trim of the apparel item itself. EXCLUDE the photo backdrop (table/floor/paper), shadows, hangtags, hangers, and packaging. Order by visual prominence on the garment (most-dominant first). Each entry is a hex string like '#1A2B3C'. Even a 'solid' garment usually has 2-3 distinct tones (highlight, mid, shadow) — include them so the palette captures the real fabric appearance. For prints/graphics, include each notable color. Use the actual visible color values in the photo (not the platonic ideal of the color)."],
-    "brand": "PRODUCT BRAND in CAPS — the MANUFACTURER/label brand, NOT the store. ONLY return a brand if you can READ it directly from a hangtag, neck label, sewn-in label, screen-printed logo, embroidered logo, or printed packaging — clearly and unambiguously. If the brand is partially obscured, blurry, cropped off, or you are inferring it from style/silhouette/store association — RETURN EMPTY STRING. Do NOT guess based on the look of the item, the retailer, or similar items in the batch. Examples of acceptable identifications (only if literally visible): NIKE, JORDAN, CONVERSE, HURLEY, LEVI'S, LACOSTE, POLO, ADIDAS, PUMA, GAP, OLD NAVY, PRIMARK, H&M, CAT & JACK, WONDER NATION, GARANIMALS, CARTER'S, OSHKOSH, 3BRAND, ROXY, QUIKSILVER. NOTE: store-house brands ARE brands (Cat & Jack is Target's, Wonder Nation is Walmart's) — but still only label them when the actual logo/text is visible. WHEN IN DOUBT, RETURN EMPTY STRING.",
+  {{{rotation_fields}
+    "garment_colors": ["UP TO 6 hex color codes (#RRGGBB) for the ACTUAL GARMENT'S colors — fabric, prints, embroidery, trim. EXCLUDE backdrop, shadows, hangtags. Order by prominence. Even solids have 2-3 tones (highlight/mid/shadow)."],
+    "brand": "PRODUCT BRAND in CAPS — the MANUFACTURER/label brand, NOT the store. ONLY return a brand you can READ directly from a hangtag, neck label, sewn-in label, screen-printed logo, embroidered logo, or packaging — clearly and unambiguously. If partially obscured, blurry, or inferred from style/retailer — RETURN EMPTY STRING. Examples (only if literally visible): NIKE, JORDAN, CONVERSE, HURLEY, LEVI'S, LACOSTE, POLO, ADIDAS, PUMA, GAP, OLD NAVY, PRIMARK, H&M, CAT & JACK, WONDER NATION, GARANIMALS, CARTER'S, OSHKOSH, 3BRAND, ROXY, QUIKSILVER. WHEN IN DOUBT, RETURN EMPTY STRING.",
     "category": "EXACTLY ONE OF: {cat_str}. See category definitions below.",
     "gender": "EXACTLY ONE OF: {gender_str}. Determine from sizing tag, styling, packaging.",
-    "product": "Short PO-style label naming the actual garment type. Use straightforward, common apparel terminology. e.g. 'S/S Tee', 'L/S Tee', 'Polo S/S', 'Tank Top', 'Fleece Hoody', 'Zip Hoody', 'Crewneck Sweatshirt', 'Mesh Short', 'Sweat Short', 'Denim Jean', 'Fleece Jogger', 'Puffer Jacket', 'Bomber Jacket', 'Knit Sweater', 'Ribbed Tank', 'Slip Dress', 'Bodysuit', 'Onesie', 'Two-Piece Set'. Under 6 words. CRITICAL — DO NOT default to niche labels: NEVER use 'Leg Warmers', 'Thermal Underwear', 'Diaper Cover', 'Long Underwear', 'Compression Sleeve', or any other obscure label unless the hangtag literally says so. If you see two cylinders with elastic at one end → SHORTS (athletic / mesh / sweat short), NOT leg warmers. If you see a zip-front grey garment with a brand logo → ZIP HOODY or TRACK JACKET, NOT thermal underwear. If you see an elastic-waist garment laid flat → SHORT or PANT, NOT diaper cover. Default to mainstream apparel categories.",
+    "product": "Short PO-style label. e.g. 'S/S Tee', 'L/S Tee', 'Polo S/S', 'Tank Top', 'Fleece Hoody', 'Zip Hoody', 'Crewneck Sweatshirt', 'Mesh Short', 'Sweat Short', 'Denim Jean', 'Fleece Jogger', 'Puffer Jacket', 'Bomber Jacket'. Under 6 words. NEVER use 'Leg Warmers', 'Thermal Underwear', 'Diaper Cover', 'Long Underwear', or obscure labels unless the hangtag literally says so.",
     "colorways": "Plain-language color description. e.g. 'Black, Cream' or 'Tie-dye Pink'.",
     "fabric": "Material if labeled. e.g. '100% Cotton', 'Polyester Fleece'. Empty if not visible.",
-    "details": "Notable features that are CLEARLY VISIBLE in the photo. One short phrase. e.g. 'Puff print front graphic', 'Acid wash finish', 'Drop shoulder oversized fit', 'Embroidered chenille patch'. ONLY describe features you can actually see — do NOT speculate about construction, lining, or hidden detailing. If nothing distinctive is clearly visible, RETURN EMPTY STRING. Do not pad with generic phrases like 'standard fit' or 'classic styling'.",
-    "bought_from": "Retailer/store where sample was purchased — usually printed on the hangtag or price sticker. e.g. 'Primark', 'H&M', 'Old Navy', 'TJ Maxx', 'Target', 'Walmart', 'Macy's', 'Ross'. Empty if not visible.",
-    "price": "Selling price ON THE TAG. Format '$X.99'. Check hangtags, stickers, packaging. Empty if not visible.",
-    "confidence": "HIGH only when brand AND product AND category are all derived from clearly visible labels/tags/logos in the photo (no guessing). MEDIUM when most fields are confident but one or two are inferred. LOW when significant fields are guesses or the photo is partially obscured. Be strict — when uncertain, choose MEDIUM not HIGH."
+    "details": "Notable features CLEARLY VISIBLE in the photo. One short phrase. e.g. 'Puff print front graphic', 'Acid wash finish', 'Drop shoulder oversized fit'. ONLY what you can see. RETURN EMPTY STRING if nothing distinctive.",
+    "bought_from": "Retailer where sample was purchased. e.g. 'Primark', 'H&M', 'Old Navy', 'TJ Maxx', 'Target', 'Walmart'. Empty if not visible.",
+    "price": "Selling price ON THE TAG. Format '$X.99'. Empty if not visible.",
+    "confidence": "HIGH only when brand, product, and category all come from clearly visible labels/tags. MEDIUM when one or two fields are inferred. LOW when significant fields are guesses."
   }}
 ]}}
-
-ROTATION DETECTION — STEP BY STEP:
-1. Find the garment's anatomical reference points. Use whichever apply:
-   - Tops/Outerwear/Sets/Sleepwear: neckline, collar, shoulders → TOP. Hem → BOTTOM.
-   - Bottoms: waistband (wider, with belt loops or elastic) → TOP. Leg openings → BOTTOM.
-   - Dresses/Rompers/Jumpsuits: straps/neckline → TOP. Hem/leg openings → BOTTOM.
-   - Swimwear (one-piece, bikini top, trunks): straps/waistband/back of suit → TOP.
-     Leg openings, halter ties, or rear flap → BOTTOM. A one-piece swimsuit lying with
-     the leg openings on the LEFT or RIGHT (instead of bottom) IS sideways.
-   - Footwear: toe → LEFT or RIGHT (typically LEFT for one shoe), heel opposite.
-   - Accessories (hats/bags): wearable opening → BOTTOM (the side that goes against the
-     body or head). Logo text on the item should read left-to-right.
-2. Where are those reference points ACTUALLY in the photo?
-   - If the natural-top points to the RIGHT side of the photo → rotated CCW, answer 90.
-   - If the natural-top points to the LEFT side  → rotated CW,  answer 270.
-   - If the natural-top is at the BOTTOM        → upside-down,  answer 180.
-   - If the natural-top is at the TOP           → already correct, answer 0.
-3. Cross-check: any text/logo on the garment or tag should read horizontally
-   left-to-right when oriented correctly. If the text is sideways, the photo is rotated.
-4. If the garment has no clear top/bottom (a folded scarf, a flat square accessory),
-   default to 0 — DO NOT guess a rotation.
-
+{rotation_section}
 GARMENT COLOR EXTRACTION:
-- Look at the GARMENT ONLY. Ignore the photo backdrop completely.
-- For SOLID color garments: pick 2-3 hex codes for the highlight, mid-tone, and shadow.
-- For MULTI-color: pick the dominant base color first, then accent/print colors.
-- Use the actual hue/saturation/lightness you see in the photo (not what the color "would be" under perfect lighting).
-- Example: a navy hoody might be ['#1B2540', '#2E3B5C', '#0E1424'] for highlight/mid/shadow.
-- Example: a tie-dye tee might be ['#F2C2D8', '#E899B8', '#9F4A70', '#FFFFFF'] for the fabric tones.
+- Garment only — ignore backdrop, shadows, tags.
+- Solid garments: 2-3 hex codes (highlight/mid/shadow).
+- Multi-color: dominant base first, then accents.
+- Use actual visible colors, not idealized values.
 
 CATEGORY DEFINITIONS — USE EXACTLY ONE:
 - Tops = upper-body garments (tee, polo, hoody, sweatshirt, crew, tank, henley, sweater).
@@ -676,13 +674,14 @@ def _run_analysis_batch(client, model_id, samples, presenter_name,
                                                      "media_type": "image/jpeg",
                                                      "data": b64}})
     content.append({"type": "text", "text": _build_analysis_prompt(
-        presenter_name, len(samples), default_bought_from)})
+        presenter_name, len(samples), default_bought_from,
+        include_rotation=auto_rotate)})
 
     cost = 0.0
     for attempt in range(4):
         try:
             resp = client.messages.create(
-                model=model_id, max_tokens=8192,
+                model=model_id, max_tokens=4096,
                 system=[{"type": "text", "text": ANALYSIS_SYSTEM,
                          "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": content}],
@@ -1432,39 +1431,29 @@ def build_presentation_order_slide(prs, deck):
             _txt(s, f"{i+1}.", Inches(3.0), y, Inches(0.7), col_h_each,
                  size=22, bold=False, color=P_CARD,
                  font=TITLE_FONT, align="left", anchor="middle")
-            _txt(s, p.name.upper(), Inches(3.7), y, Inches(7.2), col_h_each,
+            _txt(s, p.name.upper(), Inches(3.7), y, Inches(8.0), col_h_each,
                  size=22, bold=False, color=P_CARD,
                  font=TITLE_FONT, align="left", anchor="middle")
-            sample_n = len(p.samples)
-            _txt(s, f"{sample_n}", Inches(10.9), y, Inches(0.6), col_h_each,
-                 size=14, bold=True, color=RGBColor(0xC8, 0xC4, 0xBC),
-                 font=HEADER_FONT, align="right", anchor="middle")
     else:
         per = (n + 1) // 2
         for i, p in enumerate(presenters):
             col = 0 if i < per else 1
             row = i if col == 0 else i - per
-            x_num   = Inches(0.9) if col == 0 else Inches(7.0)
-            x_name  = Inches(1.7) if col == 0 else Inches(7.8)
-            x_count = Inches(6.5) if col == 0 else Inches(12.6)
+            x_num  = Inches(0.9) if col == 0 else Inches(7.0)
+            x_name = Inches(1.7) if col == 0 else Inches(7.8)
             y = top + col_h_each * row
             _txt(s, f"{i+1}.", x_num, y, Inches(0.7), col_h_each,
                  size=18, bold=False, color=P_CARD,
                  font=TITLE_FONT, align="left", anchor="middle")
-            _txt(s, p.name.upper(), x_name, y, Inches(4.6), col_h_each,
+            _txt(s, p.name.upper(), x_name, y, Inches(5.0), col_h_each,
                  size=18, bold=False, color=P_CARD,
                  font=TITLE_FONT, align="left", anchor="middle")
-            sample_n = len(p.samples)
-            _txt(s, f"{sample_n}", x_count - Inches(0.3), y, Inches(0.5), col_h_each,
-                 size=12, bold=True, color=RGBColor(0xC8, 0xC4, 0xBC),
-                 font=HEADER_FONT, align="right", anchor="middle")
 
 
-def build_presenter_cover(prs, presenter, deck, sample_count):
+def build_presenter_cover(prs, presenter, deck):
     s = _blank_slide(prs)
     _bg(s, P_BLACK)
-    _header_bar(s, deck,f"{presenter.name.upper()} — GRID")
-    # Big presenter name centered
+    _header_bar(s, deck, f"{presenter.name.upper()} — GRID")
     _txt(s, presenter.name.upper(),
          Inches(0.5), Inches(2.6), Inches(12.33), Inches(1.6),
          size=72, bold=False, color=P_CARD,
@@ -1473,7 +1462,7 @@ def build_presenter_cover(prs, presenter, deck, sample_count):
          Inches(0.5), Inches(4.2), Inches(12.33), Inches(0.6),
          size=30, bold=False, color=P_CARD,
          font=TITLE_FONT, align="center", anchor="middle")
-    _txt(s, f"{sample_count} SAMPLE{'S' if sample_count != 1 else ''} · {deck.meeting_date or ''}",
+    _txt(s, deck.meeting_date or "",
          Inches(0.5), Inches(4.9), Inches(12.33), Inches(0.4),
          size=14, bold=True, color=RGBColor(0xC8, 0xC4, 0xBC),
          font=HEADER_FONT, align="center", anchor="middle")
@@ -1720,12 +1709,12 @@ def build_deck(deck, output_path, on_progress=None):
 
     for p in presenters:
         sorted_samples = sort_samples(p.samples)
-        build_presenter_cover(prs, p, deck, len(sorted_samples))
-
-        # Resolve groups by stable merge_into identity (with legacy adjacency
-        # fallback). This means a sample merged into garment X stays with X
-        # even if the user changed X's category and the sort order shifted.
         groups = resolve_merge_groups(sorted_samples)
+
+        # Only include the "GRID" presenter cover when at least one merged
+        # group actually has multiple photos — otherwise the cover is noise.
+        if any(extras for _, extras in groups):
+            build_presenter_cover(prs, p, deck)
 
         for primary, extras in groups:
             # Auto-populate color palette from the primary photo if needed.
@@ -1794,13 +1783,9 @@ def init_state():
     if "_seen_hashes" not in st.session_state:
         st.session_state._seen_hashes = {}
     if "auto_merge_duplicates" not in st.session_state:
-        st.session_state.auto_merge_duplicates = False
+        st.session_state.auto_merge_duplicates = True
     if "auto_rotate" not in st.session_state:
-        # OFF by default. AI orientation judgment on flat-lay apparel is
-        # unreliable enough that on average it introduces more wrong rotations
-        # than it fixes. The per-sample rotate buttons in the Review step are
-        # the reliable path. Users can opt in via the Analyze step checkbox.
-        st.session_state.auto_rotate = False
+        st.session_state.auto_rotate = True
     if "include_details" not in st.session_state:
         # Default ON to preserve existing deck behavior. User can disable
         # from the sidebar to drop the AI-extracted "notable features" line
@@ -2072,12 +2057,10 @@ def show_analyze():
     st.markdown("### AI analysis")
     st.caption("Claude reads each photo, extracts brand / category / gender / store / price / "
                "fabric / details and prefills the slide fields. You can edit anything in the next step.")
-    cA, cB, cC = st.columns(3)
+    cA, cB = st.columns(2)
     cA.markdown(f'<div class="srb-stat">{len(presenters_with_samples)}</div>'
                 f'<div class="srb-stat-label">Presenters</div>', unsafe_allow_html=True)
-    cB.markdown(f'<div class="srb-stat">{total_samples}</div>'
-                f'<div class="srb-stat-label">Samples</div>', unsafe_allow_html=True)
-    cC.markdown(f'<div class="srb-stat">{model.upper()}</div>'
+    cB.markdown(f'<div class="srb-stat">{model.upper()}</div>'
                 f'<div class="srb-stat-label">Model</div>', unsafe_allow_html=True)
 
     if not api_key:
@@ -2089,30 +2072,19 @@ def show_analyze():
         st.error("anthropic package missing. `pip install -r requirements.txt` and reload.")
         return
 
-    # Auto-merge toggle — opt-in. When on, after the main analysis we run a
-    # second pass that asks Claude to detect photos showing the same garment
-    # (front/back/detail) and combine them onto one slide. Adds ~$0.03 per
-    # presenter on Sonnet but saves a lot of manual checkbox clicking.
     st.session_state.auto_merge_duplicates = st.checkbox(
-        "🤖 Auto-detect duplicate photos (combine front/back/detail shots onto one slide)",
+        "Auto-detect duplicate photos (combine front/back/detail shots onto one slide)",
         value=st.session_state.auto_merge_duplicates,
         help="After classification, asks Claude to identify which photos show "
-             "the same physical garment from different angles, and merges them. "
+             "the same physical garment from different angles and merges them. "
              "You can still manually adjust in the Review step.")
 
-    # Auto-rotate toggle — opt-in. AI orientation judgment on flat-lay
-    # apparel is unreliable enough that defaulting it ON produced more
-    # wrong-orientation slides than it fixed. Left off, photos stay as
-    # uploaded (with EXIF orientation already applied) and the Review step
-    # has rotate buttons for the few that need fixing.
     st.session_state.auto_rotate = st.checkbox(
-        "🔄 Auto-rotate sideways/upside-down photos (experimental — can be wrong)",
+        "Auto-rotate sideways/upside-down photos",
         value=st.session_state.auto_rotate,
         help="Asks Claude to detect the garment's natural top and rotates the "
-             "photo to match. WARNING: on flat-lay apparel this is often wrong "
-             "(can flip a correct photo upside-down). Leave OFF and use the "
-             "rotate buttons in the Review step for the few photos that come "
-             "in sideways from the camera. Adds ~1 API call per apparel photo.")
+             "photo to match. Use the rotate buttons in the Review step for "
+             "any photos that still need adjustment.")
 
     st.write("")
     bL, bR = st.columns([1, 1])
