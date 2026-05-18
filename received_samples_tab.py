@@ -26,6 +26,7 @@ import os
 import io
 import re
 import time
+import uuid
 import logging
 import threading
 import base64
@@ -225,6 +226,11 @@ class ReceivedSample:
         self.original_path = original_path
         self.preview_path  = preview_path
         self.filename      = filename
+        # Stable identity used as a Streamlit widget-key suffix. Using a
+        # fixed UID (instead of list index) prevents session state from one
+        # sample leaking into a different sample that later occupies the
+        # same list position after a move or delete.
+        self.uid           = uuid.uuid4().hex[:12]
         # AI- or user-assigned brand. Drives which section this sample lands
         # in. Empty string before classification (bulk mode), or set
         # immediately on upload (manual mode).
@@ -1281,8 +1287,9 @@ def _ingest_uploads(label, sec, sec_idx, upl, pending=None):
 def _show_review():
     deck = st.session_state.rs_deck
     st.markdown("### Review")
-    st.caption("Per-section thumbnails. Move a photo to a different section "
-               "if a detection landed wrong. Rotate or remove as needed.")
+    st.caption(
+        "Rotate sideways photos, move misdetected samples to the correct "
+        "section, or remove unwanted ones. One action processes per click.")
 
     sections_with_samples = [s for s in deck.sections
                              if s.name.strip() and s.samples]
@@ -1296,18 +1303,21 @@ def _show_review():
     tabs = st.tabs([f"{s.name} ({len(s.samples)})"
                     for s in sections_with_samples])
     sbs = _sbs()
+
     for t_i, (tab, sec) in enumerate(zip(tabs, sections_with_samples)):
         with tab:
-            PAGE = 24
+            PAGE = 12
             n = len(sec.samples)
-            page_key = f"rs_revpage_{t_i}"
+            # Key by section name (not tab index) so renumbering after a
+            # section empties doesn't apply the wrong page to the next tab.
+            page_key = f"rs_revpage_{sec.name}"
             if n > PAGE:
                 pages = (n + PAGE - 1) // PAGE
                 page = max(0, min(st.session_state.get(page_key, 0),
-                                    pages - 1))
+                                  pages - 1))
                 st.session_state[page_key] = page
                 nav_a, nav_b, nav_c = st.columns([1, 6, 1])
-                if nav_a.button("← Prev", key=f"rs_prev_{t_i}",
+                if nav_a.button("← Prev", key=f"rs_prev_{sec.name}",
                                 disabled=(page == 0),
                                 use_container_width=True):
                     st.session_state[page_key] = page - 1
@@ -1320,7 +1330,7 @@ def _show_review():
                     f"Page <b>{page+1}</b> of <b>{pages}</b> "
                     f"— samples {lo}–{hi} of {n}</div>",
                     unsafe_allow_html=True)
-                if nav_c.button("Next →", key=f"rs_next_{t_i}",
+                if nav_c.button("Next →", key=f"rs_next_{sec.name}",
                                 disabled=(page >= pages - 1),
                                 use_container_width=True):
                     st.session_state[page_key] = page + 1
@@ -1329,55 +1339,82 @@ def _show_review():
             else:
                 visible = range(n)
 
+            # Collect at most one action per render pass. We NEVER modify
+            # sec.samples inside the loop — doing so while iterating over
+            # it by index causes samples to shift positions, turning a
+            # single move/delete into a cascade of unintended ones.
+            action = None  # ("rot"|"move"|"del", samp_ref, data)
+
             cols = st.columns(6)
             for j in visible:
                 samp = sec.samples[j]
-                col = cols[j % 6]
-                with col:
+                uid  = samp.uid          # stable across reruns; bound to this sample
+                with cols[j % 6]:
                     if os.path.exists(samp.preview_path):
                         st.image(samp.preview_path, use_container_width=True)
+
                     bc1, bc2 = st.columns(2)
-                    if bc1.button("↺", key=f"rs_rotL_{t_i}_{j}",
+                    if bc1.button("↺", key=f"rs_rotL_{uid}",
                                   help="Rotate left 90°",
                                   use_container_width=True):
-                        sbs.rotate_image_file(samp.preview_path, -90)
-                        samp.orientation_flag = False
-                        st.rerun()
-                    if bc2.button("↻", key=f"rs_rotR_{t_i}_{j}",
+                        if action is None:
+                            action = ("rot", samp, -90)
+                    if bc2.button("↻", key=f"rs_rotR_{uid}",
                                   help="Rotate right 90°",
                                   use_container_width=True):
-                        sbs.rotate_image_file(samp.preview_path, 90)
-                        samp.orientation_flag = False
-                        st.rerun()
-                    # Move-to-section dropdown (excludes current section)
-                    other_names = [n for n in section_names if n != sec.name]
-                    move_opts = ["(stay)"] + other_names
+                        if action is None:
+                            action = ("rot", samp, 90)
+
+                    # Move-to-section dropdown. Key is UID-based so that
+                    # when this sample is moved out and a different sample
+                    # occupies the same list position, the new sample gets
+                    # a fresh key with no inherited session state.
+                    other_names = [nm for nm in section_names
+                                   if nm != sec.name]
+                    move_key = f"rs_move_{uid}"
                     pick = st.selectbox(
-                        "Move", options=move_opts, index=0,
-                        key=f"rs_move_{t_i}_{j}",
+                        "Move to…", options=["(stay)"] + other_names,
+                        index=0, key=move_key,
                         label_visibility="collapsed")
-                    if pick != "(stay)":
-                        target = next(s for s in sections_with_samples
-                                      if s.name == pick)
-                        target.samples.append(samp)
-                        sec.samples.remove(samp)
-                        st.rerun()
-                    if st.button("✕ Remove", key=f"rs_del_{t_i}_{j}",
+                    if pick != "(stay)" and action is None:
+                        action = ("move", samp, pick)
+
+                    if st.button("✕ Remove", key=f"rs_del_{uid}",
                                  use_container_width=True):
-                        sec.samples.remove(samp)
-                        st.rerun()
-                    # Category + low-confidence indicator. Showing the
-                    # AI-detected category lets the user spot a wrongly
-                    # routed sample at a glance (e.g. a sock that landed
-                    # in "Nike" instead of "ALL BRANDS HOSIERY").
-                    if samp.category and samp.category != "unknown":
-                        cat_label = samp.category.upper()
-                    else:
-                        cat_label = "—"
+                        if action is None:
+                            action = ("del", samp, None)
+
+                    cat_label = (samp.category.upper()
+                                 if samp.category and samp.category != "unknown"
+                                 else "—")
                     if samp.brand_confidence == "LOW":
-                        st.caption(f"{cat_label} · ⚠ low confidence")
+                        st.caption(f"{cat_label} · ⚠ low conf")
                     else:
                         st.caption(cat_label)
+
+            # Apply the collected action after the loop so the list is
+            # never mutated mid-iteration.
+            if action:
+                act_type, samp_ref, data = action
+                if act_type == "rot":
+                    sbs.rotate_image_file(samp_ref.preview_path, data)
+                    samp_ref.orientation_flag = False
+                elif act_type == "move":
+                    target_sec = next(
+                        (s for s in sections_with_samples if s.name == data),
+                        None)
+                    if target_sec is not None:
+                        target_sec.samples.append(samp_ref)
+                        sec.samples.remove(samp_ref)
+                        # Purge the selectbox state for this sample so it
+                        # can't re-fire if anything later reuses the key.
+                        st.session_state.pop(f"rs_move_{samp_ref.uid}", None)
+                        _clamp_page(page_key, sec.samples, PAGE)
+                elif act_type == "del":
+                    sec.samples.remove(samp_ref)
+                    st.session_state.pop(f"rs_move_{samp_ref.uid}", None)
+                    _clamp_page(page_key, sec.samples, PAGE)
+                st.rerun()
 
     st.write("")
     bL, bR = st.columns([1, 1])
@@ -1386,6 +1423,18 @@ def _show_review():
     if bR.button("Build deck →", type="primary",
                  use_container_width=True, key="rs_revnext"):
         _go("build")
+
+
+def _clamp_page(page_key: str, samples: list, page_size: int):
+    """After removing a sample, ensure the stored page index doesn't point
+    past the end of the (now-shorter) list."""
+    new_n = len(samples)
+    if new_n == 0:
+        st.session_state[page_key] = 0
+        return
+    new_pages = (new_n + page_size - 1) // page_size
+    if st.session_state.get(page_key, 0) >= new_pages:
+        st.session_state[page_key] = new_pages - 1
 
 
 # ── UI: Step 4 — Build ──────────────────────────────────────────────────────

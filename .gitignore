@@ -14,6 +14,9 @@ venv/
 *.pptx
 *.tmp
 
+# Dev / test scripts
+_test_changes.py
+
 # OS / editor noise
 .DS_Store
 Thumbs.db

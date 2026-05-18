@@ -2641,6 +2641,33 @@ def render_sbs_tab():
         show_setup()
 
 
+def _show_password_gate(correct_pw: str):
+    """Full-page password screen shown before any app content when
+    APP_PASSWORD is set in secrets. Keeps the app private without
+    requiring individual user accounts — one shared team password."""
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        st.write("")
+        st.write("")
+        st.markdown(
+            "<h2 style='text-align:center;margin-bottom:0.25em;'>"
+            "Sample Recap Builder</h2>"
+            "<p style='text-align:center;color:#6B6F76;margin-bottom:2em;'>"
+            "Enter the team password to continue.</p>",
+            unsafe_allow_html=True)
+        pw = st.text_input("Password", type="password",
+                           placeholder="Team password",
+                           label_visibility="collapsed",
+                           key="pw_input")
+        if st.button("Enter", type="primary", use_container_width=True,
+                     key="pw_btn"):
+            if pw == correct_pw:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password — try again.")
+
+
 def main():
     """Entry point. Sets page config once, injects shared CSS, then renders
     the two top-level tabs. Each tab's body is fully isolated:
@@ -2652,6 +2679,14 @@ def main():
     """
     st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="🧷")
     st.markdown(APP_CSS, unsafe_allow_html=True)
+
+    # Optional password gate. Active only when APP_PASSWORD is set in
+    # secrets (or env). Leave it unset locally so dev runs skip the prompt.
+    app_pw = _get_secret("APP_PASSWORD", "")
+    if app_pw and not st.session_state.get("authenticated", False):
+        _show_password_gate(app_pw)
+        return
+
     tab_sbs, tab_rs = st.tabs([
         "Sample Recap Builder",
         "Received Samples Deck Builder",
