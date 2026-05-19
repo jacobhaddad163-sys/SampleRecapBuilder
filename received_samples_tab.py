@@ -195,20 +195,27 @@ def _slugify_section_name(name: str) -> str:
     return s
 
 
+_LOGO_EXTS = ("png", "jpg", "jpeg", "webp")
+
+
 def _resolve_brand_logo(section_name: str, override_path: str = "") -> str:
     """Return a path to the logo file the section should display, or "" if
     nothing is available (in which case the header falls back to text).
 
     Resolution order: explicit override > slug-based library lookup > none.
-    Override wins because a user uploaded it deliberately."""
+    Override wins because a user uploaded it deliberately. PNG is preferred
+    (transparent backgrounds look right on the black header bar) but we
+    fall back to JPG/JPEG/WEBP so a user with only a flat-background logo
+    can still get it on the deck."""
     if override_path and os.path.exists(override_path):
         return override_path
     slug = _slugify_section_name(section_name)
     if not slug:
         return ""
-    candidate = os.path.join(BRAND_LOGOS_DIR, f"{slug}.png")
-    if os.path.exists(candidate):
-        return candidate
+    for ext in _LOGO_EXTS:
+        candidate = os.path.join(BRAND_LOGOS_DIR, f"{slug}.{ext}")
+        if os.path.exists(candidate):
+            return candidate
     return ""
 
 
@@ -850,7 +857,9 @@ def _show_brand_logo_library():
             "`assets/brand_logos/<slug>.png` and every future deck that uses "
             "that brand will pick it up automatically.")
 
-        existing = sorted(glob.glob(os.path.join(BRAND_LOGOS_DIR, "*.png")))
+        existing = sorted(
+            f for ext in _LOGO_EXTS
+            for f in glob.glob(os.path.join(BRAND_LOGOS_DIR, f"*.{ext}")))
         if existing:
             st.caption("Currently in library:")
             cols = st.columns(min(6, max(1, len(existing))))
@@ -882,15 +891,30 @@ def _show_brand_logo_library():
                 key="rs_lib_brand_in")
         with c2:
             up = st.file_uploader(
-                "PNG file (white logo on transparent background works best)",
-                type=["png"], accept_multiple_files=False,
+                "Logo file — PNG with transparency is best; JPG/JPEG/WEBP "
+                "also accepted",
+                type=list(_LOGO_EXTS), accept_multiple_files=False,
                 key="rs_lib_up")
         if up is not None and brand_name.strip():
             slug = _slugify_section_name(brand_name)
             if not slug:
                 st.error("Couldn't derive a slug from that brand name.")
             else:
-                dest = os.path.join(BRAND_LOGOS_DIR, f"{slug}.png")
+                ext = (os.path.splitext(up.name)[1] or ".png").lower().lstrip(".")
+                if ext == "jpeg":
+                    ext = "jpg"
+                if ext not in _LOGO_EXTS:
+                    ext = "png"
+                # Remove any prior variants under different extensions so the
+                # new upload wins the _resolve_brand_logo lookup unambiguously.
+                for old_ext in _LOGO_EXTS:
+                    old = os.path.join(BRAND_LOGOS_DIR, f"{slug}.{old_ext}")
+                    if old_ext != ext and os.path.exists(old):
+                        try:
+                            os.remove(old)
+                        except Exception:
+                            pass
+                dest = os.path.join(BRAND_LOGOS_DIR, f"{slug}.{ext}")
                 try:
                     with open(dest, "wb") as fh:
                         fh.write(up.read())
@@ -997,9 +1021,9 @@ def _show_sections_manual():
         with lcol1:
             if resolved:
                 src = (
-                    "library" if resolved.endswith(
-                        f"{_slugify_section_name(sec.name)}.png")
-                        and resolved.startswith(BRAND_LOGOS_DIR)
+                    "library"
+                    if os.path.abspath(resolved).startswith(
+                        os.path.abspath(BRAND_LOGOS_DIR))
                     else "uploaded"
                 )
                 st.caption(
@@ -1008,12 +1032,12 @@ def _show_sections_manual():
             else:
                 st.caption(
                     "Logo: _not found_ — header will print the section name "
-                    "in white text. Drop a PNG named "
-                    f"**{_slugify_section_name(sec.name) or 'name'}.png** "
+                    "in white text. Drop a PNG/JPG/JPEG/WEBP named "
+                    f"**{_slugify_section_name(sec.name) or 'name'}.<ext>** "
                     f"into `assets/brand_logos/` to auto-resolve next time.")
         with lcol2:
             up = st.file_uploader(
-                "Override logo (PNG)", type=["png"],
+                "Override logo (PNG/JPG/JPEG/WEBP)", type=list(_LOGO_EXTS),
                 accept_multiple_files=False, key=f"rs_logo_{i}",
                 label_visibility="collapsed")
             if up is not None:
